@@ -23,6 +23,7 @@ RARGate adds a filtering and orchestration layer on top of rar2fs: hiding junk f
 
 ### Media Server Integration
 - **Emby, Jellyfin, and Plex** — targeted library refresh when files change
+- **Sonarr and Radarr** — fires an in-place rescan the moment a release passes SFV, so grabs import without waiting on the downloader. Radarr can additionally force-import releases whose extracted file has an obfuscated internal name (which a plain rescan rejects as "Unknown Movie")
 - **Path mapping** — translates host paths to Docker container paths
 - **Debouncing** — batches rapid file changes into efficient API calls
 - **Item caching** — reduces API load with configurable TTL
@@ -75,10 +76,29 @@ modprobe fuse
 echo "user_allow_other" >> /etc/fuse.conf
 ```
 
+### Get the binary
+
+**Option A — download a prebuilt binary.** Grab `rargate-x86_64-linux` from the [latest release](https://github.com/Nischi85/RARgate/releases/latest):
+
+```bash
+curl -L -o rargate https://github.com/Nischi85/RARgate/releases/latest/download/rargate-x86_64-linux
+chmod +x rargate && sudo mv rargate /usr/local/bin/rargate
+```
+Built on x86_64 Linux against system FUSE (libfuse). If it won't run on your distro/arch (glibc or libfuse mismatch), build from source instead.
+
+**Option B — build from source.** RARGate is a single Rust binary; with the [Rust toolchain](https://rustup.rs) installed:
+
+```bash
+git clone https://github.com/Nischi85/RARgate.git
+cd RARgate
+cargo build --release
+sudo cp target/release/rargate /usr/local/bin/rargate
+```
+
 ### Quick Start
 
 1. Place the binary and config:
-   - Binary: `/usr/local/bin/rargate`
+   - Binary: `/usr/local/bin/rargate` (see [Get the binary](#get-the-binary) above)
    - Config: `/etc/rargate/config.yaml` (see [`deploy/config.yaml.example`](deploy/config.yaml.example))
 
 2. Edit the config — at minimum set `source` and `mountpoint`
@@ -185,6 +205,20 @@ emby:
   path_mapping:
     host_paths: ["/srv/media/verified", "/srv/media/unverified"]
     emby_path: "/share"
+```
+
+**Sonarr / Radarr** (rescan + import on SFV-validate):
+```yaml
+arr:
+  enabled: true
+  radarr:
+    url: "http://YOUR_RADARR_IP:7878"
+    api_key: "YOUR_RADARR_API_KEY"
+    force_import: true       # Import obfuscated-name releases a plain rescan rejects (Radarr only)
+    path_mapping:
+      host_paths: ["/srv/media/verified", "/srv/media/unverified"]
+      emby_path: "/share"    # What those paths look like inside Radarr
+  # sonarr: same shape (no force_import) — see config.yaml.example
 ```
 
 ## Usage
