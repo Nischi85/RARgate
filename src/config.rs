@@ -272,6 +272,11 @@ pub struct ArrInstanceConfig {
     /// Maps the rargate verified host path to the path this *arr instance sees, used to
     /// match a validated release folder against the instance's series/movie paths.
     pub path_mapping: Option<PathMappingConfig>,
+    /// Force-import the in-place file via the manual-import API (movieId bypasses the
+    /// filename parse) when a matched movie still has no file. Lands obfuscated scene
+    /// names that a plain RescanMovie rejects as "Unknown Movie". Radarr only (Sonarr
+    /// ignores it). Default: true.
+    pub force_import: Option<bool>,
 }
 
 /// Metrics and status file configuration

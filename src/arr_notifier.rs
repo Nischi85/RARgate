@@ -18,7 +18,8 @@ use crate::config::{ArrConfig, ArrInstanceConfig, PathMappingConfig};
 use crate::media_notifier_common::{
     build_http_client, filter_existing_paths, post_json_with_retry, run_debounce_loop,
     translate_path, BatchProcessor, ItemCache, MediaEvent, NotifierHandle,
-    DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_MS, MEDIA_EVENT_CHANNEL_CAPACITY,
+    DEFAULT_MAX_RETRIES, DEFAULT_MEDIA_EXTENSIONS, DEFAULT_RETRY_DELAY_MS,
+    MEDIA_EVENT_CHANNEL_CAPACITY,
 };
 use crate::metrics::MetricsCollector;
 use anyhow::{Context, Result};
@@ -59,6 +60,26 @@ impl ArrKind {
 struct ArrRecord {
     id: i64,
     path: String,
+    /// Radarr movie list carries `hasFile`; Sonarr's series list does not, so it stays
+    /// `None`. Used to decide whether a matched movie still needs a force-import.
+    #[serde(rename = "hasFile", default)]
+    has_file: Option<bool>,
+}
+
+/// One importable file from `GET /api/v3/manualimport`. Radarr still parses `quality` and
+/// `languages` from the folder name even when the movie itself is unmatched, so we hand
+/// these straight back in the `ManualImport` command body. Unknown fields are ignored.
+#[derive(Clone, Deserialize)]
+struct ManualImportCandidate {
+    path: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    quality: serde_json::Value,
+    #[serde(default)]
+    languages: serde_json::Value,
+    #[serde(rename = "releaseGroup", default)]
+    release_group: Option<String>,
 }
 
 /// One configured Sonarr or Radarr instance, with its own list cache and path mapping.
@@ -69,6 +90,12 @@ struct ArrInstance {
     list_url: String,
     /// POST command URL with the api key as a query param.
     command_url: String,
+    /// GET manual-import URL (no query) — folder/filter/apikey are added per request.
+    manualimport_url: String,
+    api_key: String,
+    /// Force-import the in-place file for matched movies that still have no file. Only
+    /// ever true for Radarr (movies); Sonarr's per-episode import isn't supported here.
+    force_import: bool,
     path_mapping: Option<PathMappingConfig>,
     cache: ItemCache<ArrRecord>,
 }
@@ -84,12 +111,19 @@ impl ArrInstance {
         // the shared `post_json_with_retry` (which sets no headers) can carry the command.
         let list_url = format!("{base}/api/v3/{endpoint}?apikey={}", cfg.api_key);
         let command_url = format!("{base}/api/v3/command?apikey={}", cfg.api_key);
-        info!("Arr: {} instance at {}", name, base);
+        let manualimport_url = format!("{base}/api/v3/manualimport");
+        // Force-import is a movie-only concept; Sonarr needs per-episode ids that
+        // obfuscated names can't yield, so it stays on RescanSeries regardless of config.
+        let force_import = matches!(kind, ArrKind::Movie) && cfg.force_import.unwrap_or(true);
+        info!("Arr: {} instance at {} (force_import={})", name, base, force_import);
         Self {
             name,
             kind,
             list_url,
             command_url,
+            manualimport_url,
+            api_key: cfg.api_key.clone(),
+            force_import,
             path_mapping: cfg.path_mapping.clone(),
             cache: ItemCache::new(cache_minutes),
         }
@@ -209,10 +243,97 @@ impl ArrNotifier {
 
             for id in to_rescan {
                 self.fire_rescan(inst, id).await;
+                // A plain RescanMovie can't import scene releases whose extracted file
+                // carries an obfuscated internal name (Radarr parses the filename and
+                // rejects it as "Unknown Movie"). For matched movies that still have no
+                // file, force the in-place import by movieId, which bypasses that parse.
+                if inst.force_import {
+                    if let Some(rec) = records.iter().find(|r| r.id == id) {
+                        if rec.has_file == Some(false) {
+                            self.force_import(inst, &rec.path, id).await;
+                        }
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Force an in-place import of a matched movie's file via the manual-import API.
+    ///
+    /// `GET /manualimport` returns the candidate file(s) in the movie's own folder with
+    /// `quality`/`languages` already parsed (`filterExistingFiles=true` skips anything
+    /// already imported, making this idempotent). We pick the largest media file and POST
+    /// a `ManualImport` command carrying the `movieId`, which tells Radarr exactly which
+    /// movie the file belongs to — no filename guessing. Import mode `auto` keeps the file
+    /// in place (no move/copy), so it is safe over the read-only mount.
+    async fn force_import(&self, inst: &ArrInstance, folder: &str, movie_id: i64) {
+        let candidates = match self
+            .client
+            .get(&inst.manualimport_url)
+            .query(&[
+                ("folder", folder),
+                ("filterExistingFiles", "true"),
+                ("apikey", inst.api_key.as_str()),
+            ])
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<Vec<ManualImportCandidate>>().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Arr: {} manualimport parse failed for {}: {}", inst.name, folder, e);
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!("Arr: {} manualimport fetch failed for {}: {}", inst.name, folder, e);
+                return;
+            }
+        };
+
+        // Largest media file in the folder — samples/extras are smaller, and a single
+        // feature is the common case. (Split CD1/CD2 releases import only one part; that
+        // is a rare DVDRip edge case Radarr models poorly anyway.)
+        let pick = candidates
+            .into_iter()
+            .filter(|c| is_media_path(&c.path))
+            .max_by_key(|c| c.size);
+        let Some(file) = pick else {
+            debug!("Arr: {} no media candidate to import in {}", inst.name, folder);
+            return;
+        };
+
+        let body = serde_json::json!({
+            "name": "ManualImport",
+            "importMode": "auto",
+            "files": [{
+                "path": file.path,
+                "movieId": movie_id,
+                "quality": file.quality,
+                "languages": file.languages,
+                "releaseGroup": file.release_group,
+            }],
+        });
+        let description = format!("ManualImport movieId {movie_id}");
+        info!("Arr: {} force-importing {} for movieId {}", inst.name, file.path, movie_id);
+        match post_json_with_retry(
+            &self.client,
+            &inst.command_url,
+            &body,
+            &description,
+            inst.name,
+            self.max_retries,
+            self.retry_delay_ms,
+        )
+        .await
+        {
+            Ok(_) => debug!("Arr: {} {} accepted", inst.name, description),
+            Err(e) => warn!("Arr: {} {} failed: {}", inst.name, description, e),
+        }
     }
 
     /// POST an in-place rescan command for one resolved series/movie id.
@@ -245,6 +366,18 @@ impl ArrNotifier {
 /// Find the most specific *arr record whose path is an ancestor of (or equal to) the
 /// validated release path. Longest matching record path wins so a release nested under a
 /// series folder resolves to that series, not a shallower root.
+/// True if the path ends in a known media extension (case-insensitive). Used to skip
+/// non-media manual-import candidates (.nfo/.sub/etc.) when choosing the file to import.
+fn is_media_path(path: &str) -> bool {
+    match path.rsplit('.').next() {
+        Some(ext) => {
+            let ext = ext.to_ascii_lowercase();
+            DEFAULT_MEDIA_EXTENSIONS.contains(&ext.as_str())
+        }
+        None => false,
+    }
+}
+
 fn best_match(records: &[ArrRecord], path: &Path) -> Option<i64> {
     records
         .iter()
@@ -284,7 +417,7 @@ mod tests {
     use super::*;
 
     fn rec(id: i64, path: &str) -> ArrRecord {
-        ArrRecord { id, path: path.to_string() }
+        ArrRecord { id, path: path.to_string(), has_file: None }
     }
 
     #[test]
@@ -336,5 +469,26 @@ mod tests {
         let records = vec![rec(4, "/share/TV.Series/Star.City/")];
         let path = PathBuf::from("/share/TV.Series/Star.City/Season.1/ep");
         assert_eq!(best_match(&records, &path), Some(4));
+    }
+
+    #[test]
+    fn is_media_path_matches_known_extensions_case_insensitively() {
+        assert!(is_media_path("/x/hbrs-hjntiu.mkv"));
+        assert!(is_media_path("/x/CD1/exvid.AVI"));
+        assert!(is_media_path("/x/movie.iso"));
+        assert!(!is_media_path("/x/release.nfo"));
+        assert!(!is_media_path("/x/release.sfv"));
+        assert!(!is_media_path("/x/no_extension"));
+    }
+
+    #[test]
+    fn has_file_absent_deserializes_to_none() {
+        // Sonarr's series list omits hasFile entirely.
+        let series: ArrRecord = serde_json::from_str(r#"{"id":7,"path":"/share/TV/X"}"#).unwrap();
+        assert_eq!(series.has_file, None);
+        // Radarr carries it.
+        let movie: ArrRecord =
+            serde_json::from_str(r#"{"id":3,"path":"/share/Movies/X","hasFile":false}"#).unwrap();
+        assert_eq!(movie.has_file, Some(false));
     }
 }
