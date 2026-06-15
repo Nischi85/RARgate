@@ -1,0 +1,218 @@
+# RARGate Configuration (Simplified)
+# This file is standalone - all options documented inline.
+#
+# Hot-reload: sections tagged (hot-reloadable via SIGHUP) are picked up
+# without remounting — useful for tweaking filters or SFV behaviour. All
+# other changes require restarting rargate (and re-running the userscript
+# bundle if mount points moved).
+
+# ===================
+# PATHS
+# ===================
+source: /path/to/your/media      # Your media files location
+mountpoint: /path/to/rargate/mount              # Where filtered view appears
+
+# ===================
+# GENERAL
+# ===================
+daemon: true        # Run in background (false for testing)
+verbose: false      # Enable debug logging
+read_only: false    # Block all write operations
+no_delete: false    # Block deletions only (when read_only: false)
+
+# ===================
+# RAR2FS BACKEND
+# ===================
+rar2fs:
+  binary_path: /usr/local/bin/rar2fs                  # Path to the rar2fs executable
+  backend_mount: /path/to/rar2fs/backend      # Where rar2fs mounts the extracted view (internal — rargate reads from here)
+  max_concurrent_reads: 4                             # Cap on parallel SFV validations against rar2fs (prevents overload)
+  # rar2fs flags — tuned for streaming; only change if you know rar2fs
+  extra_options: "--seek-length=1 -o allow_other -o auto_unmount -o umask=0000 -o uid=99 -o gid=100 -o noatime -o warmup=20 -o max_read=1048576 -o max_readahead=1048576 -o async_read --iob-size=32 --hist-size=60"
+
+# ===================
+# FILTERING (hot-reloadable via SIGHUP)
+# ===================
+filters:
+  # Directories to hide (case-insensitive)
+  exclude_dirs: [sample, samples, proof, proofs, extra, extras, subs, sub, .grab]
+
+  # File patterns to hide (wildcards supported)
+  exclude_files: ["*.sfv", "*.nfo", "*.exe", "*.log", "*.txt", "*.dctmp", "*.part", "*.tmp", "*.!qB", "*.m3u", "*.meta", "*.verified", "*.embyignore"]
+
+  # Valid media extensions (for RAR extraction and Emby notifications)
+  media_extensions: [mkv, mp4, avi, m4v, mov, wmv, flv, mpg, mpeg, mp3, flac, m4a, wav, aac, ogg, wma, iso, img, bin, cue]
+
+  rar_archives:
+    enabled: true       # Extract .rar files on-the-fly via rar2fs (turn off to ignore archives entirely)
+    hide_archives: true # Hide .rar/.r00 files, show extracted content
+    cache_timeout: 900  # Seconds to cache results (inotify invalidates on changes)
+
+# ===================
+# SFV VALIDATION (hot-reloadable via SIGHUP)
+# ===================
+sfv_validation:
+  enabled: true                     # Validate downloads against their .sfv checksum files before showing them
+  default_mode: strict              # strict = require .sfv, permissive = show all
+  lazy_mode: true                   # Validate on access (faster browsing)
+  log_failures: true                # Write failed SFV checks to log_file below
+  log_file: /var/log/rargate-sfv-failures.log   # Where failed SFV validations are recorded
+  # Path fragments used to classify shares when overlay_reference.use_for_filtering = false
+  verified_share_indicators: ["/verified/"]      # Path fragments that identify the "verified" share
+  unverified_share_indicators: ["/unverified/"]  # Path fragments that identify the "unverified/in-progress" share
+  # Backoff for failed validations (prevents log spam)
+  validation_backoff:
+    max_failures: 3       # Enter cooldown after N failures
+    cooldown_seconds: 300 # Wait 5 min before retrying
+  # Download detection threshold (seconds)
+  # Files modified within this time are "in progress" - SFV failures won't be logged
+  download_threshold_seconds: 60
+  # Permissive SFV validation:
+  #
+  # | Scenario            | false (default)  | true             |
+  # |---------------------|------------------|------------------|
+  # | No SFV file         | Show             | Show             |
+  # | SFV present, passes | Show             | Show             |
+  # | SFV present, fails  | Show             | Hide             |
+  #
+  # false = Permissive directories always shown, SFV ignored
+  # true  = Permissive directories with SFV are validated; hidden if SFV fails
+  permissive_validates_sfv: true
+
+# ===================
+# WATCHER TIMING
+# ===================
+# Controls inotify-based file monitoring behavior
+watcher:
+  sfv_debounce_seconds: 30        # Wait after last file event before SFV check
+  pending_cleanup_minutes: 5      # How long to track notified directories
+  revalidation_threshold_seconds: 30  # Allow re-validation after this time
+
+# ===================
+# OVERLAY FILESYSTEM
+# ===================
+# For overlay/unionfs setups - enables layer detection and inotify
+overlay_reference:
+  verified_share_path: /path/to/verified_share           # Verified/finished downloads — must contain valid .sfv files
+  unverified_share_path: /path/to/unverified_share         # In-progress downloads — files appear here while still being written
+  work_directory: /path/to/overlay/work               # Overlay work dir (must be on same filesystem as upper)
+  merged_directory: /path/to/your/media    # Where the overlay mount combines the two — this is what rargate reads
+  use_for_filtering: true                           # Enable inotify + automatic SFV mode selection
+
+# ===================
+# FUSE OPTIONS
+# ===================
+fuse_options:
+  fsname: rargate               # Name shown in 'mount' output
+  auto_unmount: true            # Unmount automatically if rargate dies (recommended)
+  allow_other: true             # Required for Emby/SMB access
+  allow_root: false             # Let root access the mount (already covered by allow_other for most setups)
+  default_permissions: false    # Use kernel permission checks (leave off — rargate enforces its own)
+  ro: false                     # Mount read-only — overrides read_only above when true
+  nonempty: false               # Allow mounting over a non-empty directory (rarely needed)
+  permissions: "777"            # File/dir permissions (octal string or decimal)
+  attr_timeout: 600             # Kernel cache for file attributes (seconds)
+  entry_timeout: 600            # Kernel cache for directory entries (seconds)
+
+# ===================
+# MONITORING
+# ===================
+notifications:
+  enabled: true                 # Send Unraid notifications when rargate or rar2fs has problems
+  check_interval: 300           # How often (seconds) the Rust monitor checks mount health
+  max_consecutive_errors: 3     # Stop alerting after N alerts per outage — also caps the bash monitor (see crash_recovery)
+
+# ===================
+# CRASH RECOVERY
+# ===================
+crash_recovery:
+  enabled: true                 # Auto-restart the stack when rar2fs dies
+  restart_after_failures: 3     # Failed health checks before restarting (each check ≈ 60s)
+  max_restart_attempts: 5       # Stop trying after this many in a row
+  reset_after_minutes: 30       # If healthy this long, reset the attempt counter
+# Non-Unraid users: the auto-restart calls /etc/rc.d/rc.docker stop/start by
+# default. To override (e.g. systemd), export before starting the monitor:
+#   export DOCKER_STOP_CMD="systemctl stop docker"
+#   export DOCKER_START_CMD="systemctl start docker"
+
+# ===================
+# EMBY INTEGRATION
+# ===================
+emby:
+  enabled: true                                       # Trigger Emby library refresh when new media is added
+  url: "http://YOUR_EMBY_IP:8096"                     # Your Emby server URL (with port)
+  api_token: "YOUR_EMBY_API_TOKEN"                    # Emby API key — Emby Dashboard → Advanced → API Keys
+  debounce_seconds: 5                                 # Wait before triggering refresh
+  cache_minutes: 15                                   # Cache Emby library items
+  fallback_full_refresh: true                         # Full scan if targeted refresh fails
+  max_retries: 3                                      # HTTP retry attempts before giving up on a notification
+  retry_delay_ms: 1000                                # Initial backoff between retries (doubles each retry)
+  full_refresh_cooldown_seconds: 600                  # Min gap between fallback full-library refreshes
+  path_mapping:
+    host_paths: ["/path/to/verified_share", "/path/to/unverified_share"]  # Host paths that inotify watches (where files arrive on this server)
+    emby_path: "/share"                                       # What those paths look like inside the Emby container
+
+# ===================
+# JELLYFIN (Optional)
+# ===================
+# jellyfin:
+#   enabled: false
+#   url: "http://YOUR_JELLYFIN_IP:8096"
+#   api_token: "YOUR_JELLYFIN_API_TOKEN"
+#   debounce_seconds: 5
+#   cache_minutes: 15
+#   fallback_full_refresh: false
+#   max_retries: 3
+#   retry_delay_ms: 1000
+#   full_refresh_cooldown_seconds: 600
+#   path_mapping:
+#     host_paths: ["/path/to/verified_share", "/path/to/unverified_share"]
+#     emby_path: "/share"
+
+# ===================
+# PLEX (Optional)
+# ===================
+# plex:
+#   enabled: false
+#   url: "http://YOUR_PLEX_IP:32400"
+#   token: "YOUR_PLEX_TOKEN"                          # Plex uses 'token' (X-Plex-Token), not 'api_token'
+#   debounce_seconds: 5
+#   cache_minutes: 15
+#   fallback_full_refresh: false
+#   max_retries: 3
+#   retry_delay_ms: 1000
+#   full_refresh_cooldown_seconds: 600
+#   path_mapping:
+#     host_paths: ["/path/to/verified_share", "/path/to/unverified_share"]
+#     emby_path: "/share"
+
+# ===================
+# METRICS (optional)
+# ===================
+# Write a JSON status file external readers (dashboards / scripts) can poll.
+# Disabled by default — turn on if you want to expose runtime stats.
+# metrics:
+#   enabled: false
+#   status_file: /var/log/rargate-status.json
+#   update_interval_seconds: 60
+
+# ===================
+# LOGGING
+# ===================
+logging:
+  log_file: /var/log/rargate.log  # RARGate's own main activity log
+  max_size_mb: 500  # Rotate the main log when it reaches this size (MB)
+  rar2fs_diagnostics_enabled: true  # Master switch for the two rar2fs logs below; false = both off  rar2fs_log_enabled: true          # Logs rar2fs's own error/warning output (helps diagnose crashes); false = off  rar2fs_resources_enabled: true    # Logs periodic rar2fs memory/handle/IO usage (spot leaks before a crash); false = off  rar2fs_log_file: /mnt/cache/rargate/rar2fs.log  # Where the rar2fs error log is written
+  rar2fs_log_max_size_mb: 50  # Cap for the rar2fs error log
+  rar2fs_resources_log_file: /mnt/cache/rargate/rar2fs-resources.log  # Where the rar2fs usage log is written
+  rar2fs_resources_log_max_size_mb: 20  # Cap for the rar2fs usage log
+  rar2fs_resource_interval_seconds: 300  # How often to record rar2fs usage
+
+# ===================
+# CORE DUMPS
+# ===================
+# Where rar2fs/rargate crash cores are written, and how many to retain. Persistent
+# location so a SIGSEGV core survives reboot; pruned to `keep` newest to bound disk use.
+core_dumps:
+  directory: /mnt/cache/rargate/cores
+  keep: 5

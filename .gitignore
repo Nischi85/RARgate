@@ -1,0 +1,42 @@
+# Compiled binaries
+rargate
+*.exe
+
+# Build artifacts
+*.o
+*.a
+*.so
+target/
+
+# Test/temp files
+*.test
+*.prof
+*.tmp
+
+# IDE/Editor files
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.tar.gz
+*.zip
+*.bak
+
+# Logs
+*.log
+
+# Don't ignore important docs
+!README*.md
+!README*.txt
+!DEPLOYMENT.md
+!CHANGELOG*.txt
+!PERFORMANCE_REPORT*.txt
+unrar_src/
