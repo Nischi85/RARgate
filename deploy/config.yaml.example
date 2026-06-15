@@ -187,6 +187,30 @@ emby:
 #     emby_path: "/share"
 
 # ===================
+# SONARR / RADARR (Optional — rescan/import on SFV-validate)
+# ===================
+# Fires RescanSeries/RescanMovie the moment a release passes SFV. Opt-in: omit to disable.
+# arr:
+#   enabled: true
+#   sonarr:
+#     url: "http://YOUR_SONARR_IP:8989"
+#     api_key: "YOUR_SONARR_API_KEY"
+#     path_mapping:
+#       host_paths: ["/path/to/verified_share", "/path/to/unverified_share"]
+#       emby_path: "/share"           # What those paths look like inside Sonarr
+#   radarr:
+#     url: "http://YOUR_RADARR_IP:7878"
+#     api_key: "YOUR_RADARR_API_KEY"
+#     force_import: true              # Force in-place import by movieId when a matched movie still has no file (lands obfuscated scene names RescanMovie rejects as "Unknown Movie"); Radarr only
+#     path_mapping:
+#       host_paths: ["/path/to/verified_share", "/path/to/unverified_share"]
+#       emby_path: "/share"           # What those paths look like inside Radarr
+#   debounce_seconds: 5               # Coalesce rapid validations before rescanning
+#   cache_minutes: 5                  # Cache the series/movie list between rescans
+#   max_retries: 3
+#   retry_delay_ms: 1000
+
+# ===================
 # METRICS (optional)
 # ===================
 # Write a JSON status file external readers (dashboards / scripts) can poll.
