@@ -64,7 +64,10 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
 
     // Check each file listed in SFV for existence AND completeness
     for line in content.lines() {
-        let line = line.trim();
+        // Strip a leading UTF-8 BOM (PowerShell-generated SFVs are UTF-8-with-BOM,
+        // so the first comment line would otherwise read as '\u{feff};' and be
+        // mistaken for a filename).
+        let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() || line.starts_with(';') {
             continue;
         }
@@ -73,7 +76,11 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
         if let Some(space_pos) = line.rfind(' ') {
             let filename = line[..space_pos].trim();
             if !filename.is_empty() {
-                let file_path = dir_path.join(filename);
+                // SFV entries may reference a subfolder with a Windows separator
+                // (e.g. 'Sample\foo-sample.mkv'); normalise to '/' so the path
+                // resolves on Unix.
+                let rel = filename.replace('\\', "/");
+                let file_path = dir_path.join(&rel);
 
                 // Check if file exists
                 if !file_path.exists() {
@@ -105,7 +112,8 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
 /// * `false` if any file is missing
 pub fn validate_sfv_content_with_map(sfv_content: &str, actual_files: &HashMap<String, String>) -> bool {
     for line in sfv_content.lines() {
-        let line = line.trim();
+        // Strip a leading UTF-8 BOM (see validate_sfv_with_completeness).
+        let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() || line.starts_with(';') {
             continue;
         }
@@ -113,8 +121,15 @@ pub fn validate_sfv_content_with_map(sfv_content: &str, actual_files: &HashMap<S
         // SFV format: filename CRC32 (last space separates name from CRC)
         if let Some(space_pos) = line.rfind(' ') {
             let filename = line[..space_pos].trim();
-            if !filename.is_empty()
-                && !actual_files.contains_key(&filename.to_lowercase()) {
+            // SFV entries may carry a subfolder path with Windows or Unix
+            // separators (e.g. 'Sample\foo-sample.mkv'); match on the basename,
+            // since actual_files is keyed by filename.
+            let base = filename
+                .rsplit(|c| c == '/' || c == '\\')
+                .next()
+                .unwrap_or(filename);
+            if !base.is_empty()
+                && !actual_files.contains_key(&base.to_lowercase()) {
                     debug!("SFV validation failed: missing file {}", filename);
                     return false;
                 }

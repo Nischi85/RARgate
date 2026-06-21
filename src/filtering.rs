@@ -607,6 +607,18 @@ impl FilterEngine {
                         sfv_file_path = Some(entry_path);
                         debug!("SFV file found in {}: {}", source_path.display(), lower_name);
                     }
+                } else if entry_path.is_dir() {
+                    // Scene releases place samples/proofs in a subfolder that the
+                    // SFV references with a Windows path (e.g. 'Sample\foo.mkv').
+                    // Index those files by basename so such SFV entries validate.
+                    if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                        for sub in sub_entries.flatten() {
+                            if sub.path().is_file() {
+                                let sub_name = sub.file_name().to_string_lossy().to_string();
+                                actual_files.entry(sub_name.to_lowercase()).or_insert(sub_name);
+                            }
+                        }
+                    }
                 }
             }
         }
