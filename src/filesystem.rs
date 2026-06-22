@@ -520,37 +520,35 @@ impl Filesystem for RarGateFs {
             };
             after_read_dir = Instant::now();
 
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    // OPTIMIZATION: Use Cow<str> to avoid allocation for valid UTF-8 filenames
-                    let name_osstr = entry.file_name();
-                    let name_cow = name_osstr.to_string_lossy();
+            for entry in entries.flatten() {
+                // OPTIMIZATION: Use Cow<str> to avoid allocation for valid UTF-8 filenames
+                let name_osstr = entry.file_name();
+                let name_cow = name_osstr.to_string_lossy();
 
-                    // CRASH GUARD: skip still-downloading RAR sets BEFORE touching the
-                    // backend. rar2fs gives no d_type, so `entry.file_type()` below
-                    // `stat`s each child against the backend; stat'ing an incomplete set
-                    // makes rar2fs parse partial volume headers and SIGSEGV. The check
-                    // reads only the source `.sfv`, never the backend.
-                    if self.source_set_incomplete(&path.join(&*name_cow)) {
-                        continue;
-                    }
+                // CRASH GUARD: skip still-downloading RAR sets BEFORE touching the
+                // backend. rar2fs gives no d_type, so `entry.file_type()` below
+                // `stat`s each child against the backend; stat'ing an incomplete set
+                // makes rar2fs parse partial volume headers and SIGSEGV. The check
+                // reads only the source `.sfv`, never the backend.
+                if self.source_set_incomplete(&path.join(&*name_cow)) {
+                    continue;
+                }
 
-                    // OPTIMIZATION: Use file_type() from DirEntry instead of is_dir()/is_symlink()
-                    // This avoids additional stat() syscalls - file_type() uses data from readdir()
-                    let file_type = match entry.file_type() {
-                        Ok(ft) => ft,
-                        Err(_) => continue, // Skip entries we can't stat
-                    };
-                    let is_dir = file_type.is_dir();
-                    let is_symlink = file_type.is_symlink();
+                // OPTIMIZATION: Use file_type() from DirEntry instead of is_dir()/is_symlink()
+                // This avoids additional stat() syscalls - file_type() uses data from readdir()
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue, // Skip entries we can't stat
+                };
+                let is_dir = file_type.is_dir();
+                let is_symlink = file_type.is_symlink();
 
-                    // Convert to owned String only once at the end
-                    let name_owned = name_cow.into_owned();
-                    all_entries.push((name_owned.clone(), is_dir, is_symlink));
+                // Convert to owned String only once at the end
+                let name_owned = name_cow.into_owned();
+                all_entries.push((name_owned.clone(), is_dir, is_symlink));
 
-                    if is_dir {
-                        dir_names.push(name_owned);
-                    }
+                if is_dir {
+                    dir_names.push(name_owned);
                 }
             }
         }

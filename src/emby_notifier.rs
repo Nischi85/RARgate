@@ -361,13 +361,15 @@ impl EmbyNotifier {
                         let item_path = PathBuf::from(item_path_str);
                         if item_path == parent {
                             let id = item.id.clone();
-                            if !parent_items.contains_key(&id) {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                parent_items.entry(id.clone())
+                            {
                                 info!("{}: [PARENT] Found parent container: {} \"{}\" (ID: {})",
                                     server_name,
                                     item.item_type.as_deref().unwrap_or("Unknown"),
                                     item.name.as_deref().unwrap_or("Unknown"),
                                     id);
-                                parent_items.insert(id, item.clone());
+                                e.insert(item.clone());
                             }
                             found = true;
                             break;

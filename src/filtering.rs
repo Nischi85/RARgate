@@ -543,17 +543,15 @@ impl FilterEngine {
                 }
             };
 
-            for entry in backend_entries {
-                if let Ok(entry) = entry {
-                    let entry_path = entry.path();
-                    if entry_path.is_file() {
-                        // O(1) HashSet lookup: find the dot, slice extension, check membership
-                        let lower_name = entry.file_name().to_string_lossy().to_lowercase();
-                        if let Some(dot_pos) = lower_name.rfind('.') {
-                            if media_extensions.contains(&lower_name[dot_pos..]) {
-                                has_media = true;
-                                break;
-                            }
+            for entry in backend_entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_file() {
+                    // O(1) HashSet lookup: find the dot, slice extension, check membership
+                    let lower_name = entry.file_name().to_string_lossy().to_lowercase();
+                    if let Some(dot_pos) = lower_name.rfind('.') {
+                        if media_extensions.contains(&lower_name[dot_pos..]) {
+                            has_media = true;
+                            break;
                         }
                     }
                 }
@@ -592,31 +590,29 @@ impl FilterEngine {
         let mut sfv_file_path = None;
         let mut actual_files = std::collections::HashMap::new(); // Build once for SFV validation
 
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let entry_path = entry.path();
-                if entry_path.is_file() {
-                    let filename = entry.file_name().to_string_lossy().to_string();
-                    let lower_name = filename.to_lowercase();
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                let lower_name = filename.to_lowercase();
 
-                    // Build case-insensitive filename map for SFV validation (RAR parts, etc.)
-                    actual_files.insert(lower_name.clone(), filename);
+                // Build case-insensitive filename map for SFV validation (RAR parts, etc.)
+                actual_files.insert(lower_name.clone(), filename);
 
-                    if lower_name.ends_with(".sfv") {
-                        has_sfv = true;
-                        sfv_file_path = Some(entry_path);
-                        debug!("SFV file found in {}: {}", source_path.display(), lower_name);
-                    }
-                } else if entry_path.is_dir() {
-                    // Scene releases place samples/proofs in a subfolder that the
-                    // SFV references with a Windows path (e.g. 'Sample\foo.mkv').
-                    // Index those files by basename so such SFV entries validate.
-                    if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
-                        for sub in sub_entries.flatten() {
-                            if sub.path().is_file() {
-                                let sub_name = sub.file_name().to_string_lossy().to_string();
-                                actual_files.entry(sub_name.to_lowercase()).or_insert(sub_name);
-                            }
+                if lower_name.ends_with(".sfv") {
+                    has_sfv = true;
+                    sfv_file_path = Some(entry_path);
+                    debug!("SFV file found in {}: {}", source_path.display(), lower_name);
+                }
+            } else if entry_path.is_dir() {
+                // Scene releases place samples/proofs in a subfolder that the
+                // SFV references with a Windows path (e.g. 'Sample\foo.mkv').
+                // Index those files by basename so such SFV entries validate.
+                if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                    for sub in sub_entries.flatten() {
+                        if sub.path().is_file() {
+                            let sub_name = sub.file_name().to_string_lossy().to_string();
+                            actual_files.entry(sub_name.to_lowercase()).or_insert(sub_name);
                         }
                     }
                 }

@@ -197,6 +197,14 @@ struct WatchLoopContext {
     metrics: Option<Arc<MetricsCollector>>,
 }
 
+/// Invariant limits for the recursive watch-adding walk, grouped so the recursion
+/// threads one context instead of three unchanging arguments.
+struct WatchLimits<'a> {
+    max_depth: usize,
+    max_watches: usize,
+    exclude_dirs: &'a [String],
+}
+
 impl InotifyWatcher {
     pub fn new(
         overlay_config: &OverlayConfig,
@@ -434,9 +442,10 @@ impl InotifyWatcher {
         let mut watch_count = 0;
         let (max_watches, system_limit) = Self::get_max_watches();
         const MAX_DEPTH: usize = 10; // Limit depth to prevent excessive recursion
+        let limits = WatchLimits { max_depth: MAX_DEPTH, max_watches, exclude_dirs };
 
-        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, verified_path, 0, MAX_DEPTH, &mut watch_count, max_watches, exclude_dirs)?;
-        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, unverified_path, 0, MAX_DEPTH, &mut watch_count, max_watches, exclude_dirs)?;
+        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, verified_path, 0, &mut watch_count, &limits)?;
+        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, unverified_path, 0, &mut watch_count, &limits)?;
 
         if watch_count >= max_watches {
             let percentage = (max_watches * 100) / system_limit;
@@ -942,24 +951,22 @@ impl InotifyWatcher {
         watch_map: &mut HashMap<inotify::WatchDescriptor, PathBuf>,
         path: &Path,
         current_depth: usize,
-        max_depth: usize,
         watch_count: &mut usize,
-        max_watches: usize,
-        exclude_dirs: &[String],
+        limits: &WatchLimits,
     ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
 
         // Check depth limit
-        if current_depth >= max_depth {
-            debug!("Reached max depth {} at path {}", max_depth, path.display());
+        if current_depth >= limits.max_depth {
+            debug!("Reached max depth {} at path {}", limits.max_depth, path.display());
             return Ok(());
         }
 
         // Check watch count limit
-        if *watch_count >= max_watches {
-            debug!("Reached max watch count {} at path {}", max_watches, path.display());
+        if *watch_count >= limits.max_watches {
+            debug!("Reached max watch count {} at path {}", limits.max_watches, path.display());
             return Ok(());
         }
 
@@ -985,7 +992,7 @@ impl InotifyWatcher {
                     if let Ok(metadata) = entry.metadata() {
                         if metadata.is_dir() {
                             // Skip excluded directories
-                            if is_excluded_dir(exclude_dirs, &entry.path()) {
+                            if is_excluded_dir(limits.exclude_dirs, &entry.path()) {
                                 continue;
                             }
                             Self::add_watch_recursive_limited(
@@ -993,10 +1000,8 @@ impl InotifyWatcher {
                                 watch_map,
                                 &entry.path(),
                                 current_depth + 1,
-                                max_depth,
                                 watch_count,
-                                max_watches,
-                                exclude_dirs,
+                                limits,
                             )?;
                         }
                     }
@@ -1017,7 +1022,8 @@ impl InotifyWatcher {
     ) -> Result<()> {
         let mut watch_count = watch_map.len();
         const MAX_DEPTH: usize = 10;
-        Self::add_watch_recursive_limited(inotify, watch_map, path, 0, MAX_DEPTH, &mut watch_count, max_watches, exclude_dirs)
+        let limits = WatchLimits { max_depth: MAX_DEPTH, max_watches, exclude_dirs };
+        Self::add_watch_recursive_limited(inotify, watch_map, path, 0, &mut watch_count, &limits)
     }
 
     /// Send cache invalidation notification

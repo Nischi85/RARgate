@@ -125,7 +125,7 @@ pub fn validate_sfv_content_with_map(sfv_content: &str, actual_files: &HashMap<S
             // separators (e.g. 'Sample\foo-sample.mkv'); match on the basename,
             // since actual_files is keyed by filename.
             let base = filename
-                .rsplit(|c| c == '/' || c == '\\')
+                .rsplit(['/', '\\'])
                 .next()
                 .unwrap_or(filename);
             if !base.is_empty()
