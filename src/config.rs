@@ -82,6 +82,9 @@ pub struct ValidationBackoffConfig {
     pub max_failures: Option<u32>,
     /// Cooldown duration in seconds before retrying after max failures. Default: 300 (5 minutes)
     pub cooldown_seconds: Option<u64>,
+    /// Consecutive failures after which a single loud ERROR is logged and the release
+    /// is flagged as stuck in the status file (likely incomplete/abandoned). Default: 25
+    pub escalate_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

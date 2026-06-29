@@ -77,6 +77,12 @@ struct FailedValidation {
     last_attempt: Instant,
     /// Number of consecutive failures
     failure_count: u32,
+    /// Wall-clock time of the first failure, for "stuck for N" reporting
+    first_seen: std::time::SystemTime,
+    /// Highest milestone already logged at WARN (throttles per-cooldown spam)
+    last_milestone_logged: u32,
+    /// Whether the one-time escalation ERROR has already been emitted
+    escalated: bool,
 }
 
 /// Default cooldown duration before retrying failed validations (5 minutes)
@@ -84,6 +90,35 @@ const DEFAULT_VALIDATION_COOLDOWN_SECS: u64 = 300;
 
 /// Default maximum failures before requiring cooldown to retry
 const DEFAULT_MAX_VALIDATION_FAILURES: u32 = 3;
+
+/// Default consecutive failures after which a release is escalated: one loud ERROR
+/// plus a flag in the status file. Past this, a stuck release is almost certainly an
+/// incomplete or abandoned download rather than a still-in-progress one.
+const DEFAULT_SFV_ESCALATION_THRESHOLD: u32 = 25;
+
+/// Failure counts at which a throttled WARN is logged. Without this, a permanently
+/// broken release re-WARNs every cooldown cycle (hundreds of identical lines); we
+/// instead log only when crossing one of these milestones.
+const SFV_FAILURE_MILESTONES: &[u32] = &[3, 10, 50, 100, 500, 1000, 5000];
+
+/// Highest failure milestone reached, for throttled WARN logging.
+fn sfv_failure_milestone(count: u32) -> u32 {
+    let mut m = 0;
+    for &x in SFV_FAILURE_MILESTONES {
+        if count >= x { m = x; } else { break; }
+    }
+    m
+}
+
+/// Human-friendly elapsed duration, e.g. "4d 3h", "5h 12m", "45m", "30s".
+fn humanize_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (days, hours, mins) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    if days > 0 { format!("{days}d {hours}h") }
+    else if hours > 0 { format!("{hours}h {mins}m") }
+    else if mins > 0 { format!("{mins}m") }
+    else { format!("{s}s") }
+}
 
 /// Cleanup threshold for old failure records (1 hour) - not configurable
 const FAILURE_CLEANUP_THRESHOLD_SECS: u64 = 3600;
@@ -161,6 +196,8 @@ pub struct InotifyWatcher {
     max_validation_failures: u32,
     /// Cooldown duration in seconds after max failures
     validation_cooldown_secs: u64,
+    /// Consecutive failures after which a release is escalated (loud ERROR + status flag)
+    escalation_threshold: u32,
     /// Debounce time in seconds for SFV validation
     sfv_debounce_secs: u64,
     /// Time in seconds after which notified entries are cleaned up
@@ -191,6 +228,7 @@ struct WatchLoopContext {
     exclude_dirs: Arc<Vec<String>>,
     max_validation_failures: u32,
     validation_cooldown_secs: u64,
+    escalation_threshold: u32,
     sfv_debounce_secs: u64,
     pending_cleanup_secs: u64,
     revalidation_threshold_secs: u64,
@@ -219,6 +257,11 @@ impl InotifyWatcher {
         let validation_cooldown_secs = validation_backoff
             .and_then(|b| b.cooldown_seconds)
             .unwrap_or(DEFAULT_VALIDATION_COOLDOWN_SECS);
+        // Escalation must sit at or above max_failures (which is when WARNs begin).
+        let escalation_threshold = validation_backoff
+            .and_then(|b| b.escalate_after)
+            .unwrap_or(DEFAULT_SFV_ESCALATION_THRESHOLD)
+            .max(max_validation_failures);
 
         // Get watcher timing config with defaults
         let sfv_debounce_secs = watcher_config
@@ -252,6 +295,7 @@ impl InotifyWatcher {
             ),
             max_validation_failures,
             validation_cooldown_secs,
+            escalation_threshold,
             sfv_debounce_secs,
             pending_cleanup_secs,
             revalidation_threshold_secs,
@@ -330,6 +374,8 @@ impl InotifyWatcher {
         info!("  Re-validation threshold: {}s", self.revalidation_threshold_secs);
         info!("  Validation backoff: {} failures, {}s cooldown",
               self.max_validation_failures, self.validation_cooldown_secs);
+        info!("  SFV escalation: loud ERROR + status flag after {} failures",
+              self.escalation_threshold);
 
         let ctx = WatchLoopContext {
             verified_path: self.verified_path.clone(),
@@ -339,6 +385,7 @@ impl InotifyWatcher {
             exclude_dirs: self.exclude_dirs.clone(),
             max_validation_failures: self.max_validation_failures,
             validation_cooldown_secs: self.validation_cooldown_secs,
+            escalation_threshold: self.escalation_threshold,
             sfv_debounce_secs: self.sfv_debounce_secs,
             pending_cleanup_secs: self.pending_cleanup_secs,
             revalidation_threshold_secs: self.revalidation_threshold_secs,
@@ -394,6 +441,7 @@ impl InotifyWatcher {
         let metrics = ctx.metrics.as_ref();
         let max_validation_failures = ctx.max_validation_failures;
         let validation_cooldown_secs = ctx.validation_cooldown_secs;
+        let escalation_threshold = ctx.escalation_threshold;
         let sfv_debounce_secs = ctx.sfv_debounce_secs;
         let pending_cleanup_secs = ctx.pending_cleanup_secs;
         let revalidation_threshold_secs = ctx.revalidation_threshold_secs;
@@ -535,6 +583,7 @@ impl InotifyWatcher {
                     if validation_result {
                         // SFV valid - clear any previous failure state
                         failed_validations.pop(&dir_path);
+                        if let Some(m) = metrics { m.clear_stuck(&dir_path); }
 
                         // Refresh overlay cache so rar2fs sees new files on the next access.
                         Self::refresh_overlay_cache(&dir_path, verified_path, overlay_merged_path, &mut overlay_refresh_last);
@@ -581,21 +630,63 @@ impl InotifyWatcher {
                         }
                     } else {
                         // Validation failed - track failure for backoff
-                        let failure_count = if let Some(existing) = failed_validations.get_mut(&dir_path) {
-                            existing.failure_count += 1;
-                            existing.last_attempt = now;
-                            existing.failure_count
-                        } else {
-                            failed_validations.put(dir_path.clone(), FailedValidation {
-                                last_attempt: now,
-                                failure_count: 1,
-                            });
-                            1
-                        };
+                        let now_wall = std::time::SystemTime::now();
+                        let (failure_count, first_seen) =
+                            if let Some(existing) = failed_validations.get_mut(&dir_path) {
+                                existing.failure_count += 1;
+                                existing.last_attempt = now;
+                                (existing.failure_count, existing.first_seen)
+                            } else {
+                                failed_validations.put(dir_path.clone(), FailedValidation {
+                                    last_attempt: now,
+                                    failure_count: 1,
+                                    first_seen: now_wall,
+                                    last_milestone_logged: 0,
+                                    escalated: false,
+                                });
+                                (1, now_wall)
+                            };
 
                         if failure_count >= max_validation_failures {
-                            warn!("SFV validation failed {} times for {}, entering cooldown ({}s) - check for missing or incomplete files",
-                                   failure_count, dir_path.display(), validation_cooldown_secs);
+                            let stuck_for = humanize_duration(first_seen.elapsed().unwrap_or_default());
+                            // Read prior throttle state without bumping LRU recency.
+                            let (prev_milestone, already_escalated) = failed_validations
+                                .peek(&dir_path)
+                                .map(|f| (f.last_milestone_logged, f.escalated))
+                                .unwrap_or((0, false));
+
+                            if failure_count >= escalation_threshold && !already_escalated {
+                                // One loud, distinct line — easy to spot in the log — then go
+                                // quiet (the status file carries it from here).
+                                error!("🛑 PERSISTENT SFV FAILURE: {} — failed {} times over {}; likely an incomplete or abandoned download. Re-grab or remove it.",
+                                       dir_path.display(), failure_count, stuck_for);
+                                if let Some(f) = failed_validations.get_mut(&dir_path) {
+                                    f.escalated = true;
+                                    f.last_milestone_logged = failure_count;
+                                }
+                            } else if !already_escalated {
+                                // Throttle WARNs to milestone crossings (3, 10, 50, 100, ...)
+                                // instead of one per cooldown cycle.
+                                let milestone = sfv_failure_milestone(failure_count);
+                                if milestone > prev_milestone {
+                                    warn!("SFV validation failed {} times for {} (stuck {}), entering cooldown ({}s) - check for missing or incomplete files",
+                                          failure_count, dir_path.display(), stuck_for, validation_cooldown_secs);
+                                    if let Some(f) = failed_validations.get_mut(&dir_path) {
+                                        f.last_milestone_logged = milestone;
+                                    }
+                                } else {
+                                    debug!("SFV validation still failing for {} ({} times, stuck {}), in cooldown",
+                                           dir_path.display(), failure_count, stuck_for);
+                                }
+                            } else {
+                                debug!("SFV validation still failing (already escalated) for {} ({} times)",
+                                       dir_path.display(), failure_count);
+                            }
+
+                            // Surface to the status file so operators have one place to look.
+                            if let Some(m) = metrics {
+                                m.record_stuck(&dir_path, failure_count, first_seen);
+                            }
                         } else {
                             debug!("SFV validation failed for {} (attempt {}/{}, took {:.1}ms), will retry after next file event",
                                    dir_path.display(), failure_count, max_validation_failures,
@@ -865,6 +956,7 @@ impl InotifyWatcher {
                     .collect();
                 for key in failure_keys_to_remove {
                     failed_validations.pop(&key);
+                    if let Some(m) = metrics { m.clear_stuck(&key); }
                 }
 
                 // Clean up old notified entries from pending_dirs to prevent memory growth

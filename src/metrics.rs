@@ -12,14 +12,25 @@
 //!   update_interval_seconds: 60
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, warn};
 
 const DEFAULT_STATUS_FILE: &str = "/mnt/cache/rargate/rargate-status.json";
 const DEFAULT_UPDATE_INTERVAL_SECS: u64 = 60;
+
+/// A release whose SFV validation keeps failing — surfaced in the status file so
+/// operators have one place to spot incomplete/abandoned downloads instead of
+/// grepping the log for a big number buried in a repeating WARN line.
+#[derive(Clone)]
+pub struct StuckRelease {
+    pub failure_count: u32,
+    pub first_seen: SystemTime,
+    pub last_attempt: SystemTime,
+}
 
 /// Shared, lock-free metrics counters.  All increments use `Relaxed` ordering —
 /// exact consistency between counters is not required; approximate totals are enough.
@@ -60,6 +71,11 @@ pub struct MetricsCollector {
     /// Cumulative wait time across all blocked acquires (milliseconds). Divide by
     /// `rar2fs_limiter_blocked_acquires` to get average wait when the cap bites.
     pub rar2fs_limiter_total_wait_ms: AtomicU64,
+
+    /// Releases stuck failing SFV validation (path -> info). Low-frequency: written
+    /// only on repeated SFV failures, read once per status-file flush, so a plain
+    /// Mutex is fine here and keeps the hot atomic counters lock-free.
+    pub stuck_releases: Mutex<HashMap<PathBuf, StuckRelease>>,
 }
 
 impl MetricsCollector {
@@ -84,11 +100,35 @@ impl MetricsCollector {
             rar2fs_limiter_blocked_acquires: AtomicU64::new(0),
             rar2fs_limiter_acquires_total: AtomicU64::new(0),
             rar2fs_limiter_total_wait_ms: AtomicU64::new(0),
+            stuck_releases: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Record or refresh a release that is stuck failing SFV validation.
+    /// `first_seen` is the wall-clock time of its first failure (owned by the caller
+    /// so the "stuck for N" duration survives across status-file flushes).
+    pub fn record_stuck(&self, path: &Path, failure_count: u32, first_seen: SystemTime) {
+        if let Ok(mut map) = self.stuck_releases.lock() {
+            let entry = map.entry(path.to_path_buf()).or_insert(StuckRelease {
+                failure_count,
+                first_seen,
+                last_attempt: SystemTime::now(),
+            });
+            entry.failure_count = failure_count;
+            entry.first_seen = first_seen;
+            entry.last_attempt = SystemTime::now();
+        }
+    }
+
+    /// Clear a release from the stuck set (validation passed, or the record expired).
+    pub fn clear_stuck(&self, path: &Path) {
+        if let Ok(mut map) = self.stuck_releases.lock() {
+            map.remove(path);
+        }
     }
 
     /// Write current counters to a JSON status file.
@@ -123,6 +163,34 @@ impl MetricsCollector {
             lim_wait_ms as f64 / lim_blocked as f64
         } else {
             0.0
+        };
+
+        // Build the stuck-releases array (sorted by failure_count, worst first).
+        let (stuck_count, stuck_json) = match self.stuck_releases.lock() {
+            Ok(map) => {
+                let mut entries: Vec<(&PathBuf, &StuckRelease)> = map.iter().collect();
+                entries.sort_by(|a, b| b.1.failure_count.cmp(&a.1.failure_count));
+                let items: Vec<String> = entries.iter().map(|(p, s)| {
+                    let path_json = serde_json::to_string(&p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "\"\"".to_string());
+                    let first = chrono::DateTime::<chrono::Utc>::from(s.first_seen)
+                        .with_timezone(&chrono::Local).format("%Y-%m-%dT%H:%M:%S%z");
+                    let last = chrono::DateTime::<chrono::Utc>::from(s.last_attempt)
+                        .with_timezone(&chrono::Local).format("%Y-%m-%dT%H:%M:%S%z");
+                    let stuck_secs = s.first_seen.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                    format!(
+                        "    {{ \"path\": {path_json}, \"failure_count\": {fc}, \"first_seen\": \"{first}\", \"last_attempt\": \"{last}\", \"stuck_seconds\": {stuck_secs} }}",
+                        fc = s.failure_count
+                    )
+                }).collect();
+                let json = if items.is_empty() {
+                    "[]".to_string()
+                } else {
+                    format!("[\n{}\n  ]", items.join(",\n"))
+                };
+                (entries.len(), json)
+            }
+            Err(_) => (0usize, "[]".to_string()),
         };
 
         // Build JSON manually to avoid pulling in serde_json for just this use case
@@ -164,7 +232,9 @@ impl MetricsCollector {
     "block_rate_pct": {lim_block_rate:.1},
     "total_wait_ms": {lim_wait_ms},
     "avg_wait_ms_when_blocked": {lim_avg_wait_ms:.1}
-  }}
+  }},
+  "stuck_releases_count": {stuck_count},
+  "stuck_releases": {stuck_json}
 }}"#,
             version = version,
             now = now,
@@ -191,6 +261,8 @@ impl MetricsCollector {
             lim_block_rate = lim_block_rate,
             lim_wait_ms = lim_wait_ms,
             lim_avg_wait_ms = lim_avg_wait_ms,
+            stuck_count = stuck_count,
+            stuck_json = stuck_json,
         );
 
         // Create parent directory if needed
