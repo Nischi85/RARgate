@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{sleep, Duration};
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 
 use crate::config::NotificationConfig;
 
@@ -423,5 +423,5 @@ fn log_rar2fs_stats(stats: &Rar2fsStats, log_path: &std::path::Path) {
     }
 
     // Also log to tracing at debug level
-    info!("rar2fs resources: {}", log_line.trim());
+    debug!("rar2fs resources: {}", log_line.trim());
 }
