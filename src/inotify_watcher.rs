@@ -1164,36 +1164,73 @@ impl InotifyWatcher {
 
         let overlay_path = merged_path.join(relative);
 
-        // Stat + readdir the overlay path to force kernel dentry cache refresh
-        // metadata() refreshes the inode, read_dir() forces re-enumeration of contents
-        match std::fs::metadata(&overlay_path) {
-            Ok(meta) => {
-                if meta.is_dir() {
-                    // Force directory re-read by iterating entries
-                    if let Ok(entries) = std::fs::read_dir(&overlay_path) {
-                        let count = entries.count();
-                        debug!("Refreshed overlay cache for: {} ({} entries)", overlay_path.display(), count);
-                    }
-                } else {
-                    debug!("Refreshed overlay cache for: {}", overlay_path.display());
+        // Walk from the overlay root DOWN the relative path, re-reading each level
+        // that exists. AirDC++ writes straight into the upperdir (`fin`) beneath a
+        // live overlay, so a brand-new directory only shows up in the merged view
+        // when its parent is re-enumerated. `read_dir` on an EXISTING directory does
+        // that and surfaces the new child; reading top-down means each level's read
+        // reveals the next, so an entire new series/season/release tree appears in
+        // one pass.
+        //
+        // Crucially we never `stat`/`metadata` a path we expect to be missing: a
+        // failed lookup caches a sticky NEGATIVE dentry that a later `read_dir`
+        // cannot evict, which is exactly what left freshly-downloaded series
+        // invisible until a manual cache drop. We only ever `read_dir` (which does
+        // not create negative entries for the dir's children) and detect presence
+        // by scanning the parent's listing for the next component's name.
+        let mut cur = merged_path.to_path_buf();
+        // Root always exists; re-enumerate it first.
+        if let Ok(entries) = std::fs::read_dir(&cur) {
+            let _ = entries.count();
+        }
+        let mut fully_present = true;
+        for comp in relative.components() {
+            let name = comp.as_os_str();
+            // Is `name` present in the (freshly re-read) parent `cur`? Check by
+            // scanning entries rather than stat'ing the child, to avoid poisoning.
+            let present = std::fs::read_dir(&cur)
+                .map(|entries| entries.filter_map(Result::ok).any(|e| e.file_name() == name))
+                .unwrap_or(false);
+            cur.push(comp);
+            if !present {
+                fully_present = false;
+                break;
+            }
+            // Re-enumerate this level so the NEXT component becomes visible.
+            if let Ok(entries) = std::fs::read_dir(&cur) {
+                let _ = entries.count();
+            }
+        }
+
+        if fully_present {
+            debug!("Refreshed overlay cache along path: {}", overlay_path.display());
+            return;
+        }
+
+        // The path still doesn't resolve after re-reading every existing ancestor —
+        // the overlay's directory cache is poisoned (a negative dentry was cached
+        // while the content was still absent, before this fix or by another reader).
+        // `read_dir` can't evict that, so drop the VFS dentry/inode caches as a last
+        // resort. Rare (only genuinely-stuck brand-new trees) and coalesced by the
+        // dedupe window above.
+        warn!("Overlay still stale for {} after re-read — dropping VFS caches to surface it", overlay_path.display());
+        Self::drop_vfs_caches();
+    }
+
+    /// Drop the kernel's dentry/inode caches (`vm.drop_caches=2`) to evict a stale
+    /// overlay directory listing. Best-effort: logged and ignored on failure. Used
+    /// only as the overlay-refresh fallback when a re-read can't surface new content.
+    fn drop_vfs_caches() {
+        use std::io::Write as _;
+        // sync first so nothing is lost, then drop dentries + inodes.
+        let _ = std::process::Command::new("sync").status();
+        match std::fs::OpenOptions::new().write(true).open("/proc/sys/vm/drop_caches") {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(b"2\n") {
+                    warn!("Overlay fallback: failed to write drop_caches: {}", e);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Path doesn't exist in overlay yet, try parent directory
-                if let Some(parent) = overlay_path.parent() {
-                    if let Ok(meta) = std::fs::metadata(parent) {
-                        if meta.is_dir() {
-                            if let Ok(entries) = std::fs::read_dir(parent) {
-                                let count = entries.count();
-                                debug!("Refreshed overlay cache for parent: {} ({} entries)", parent.display(), count);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Could not refresh overlay cache for {}: {}", overlay_path.display(), e);
-            }
+            Err(e) => warn!("Overlay fallback: cannot open drop_caches ({}); is rargate root?", e),
         }
     }
 
