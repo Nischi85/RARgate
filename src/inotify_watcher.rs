@@ -1202,17 +1202,35 @@ impl InotifyWatcher {
             }
         }
 
-        if fully_present {
+        // `fully_present` means every path COMPONENT resolved — but overlayfs can
+        // still serve a stale listing of the LEAF's CONTENTS: a release dir is created
+        // in the upperdir (empty) and cached, then its files are written, and a re-read
+        // of an already-cached dir doesn't reliably evict that empty snapshot. So also
+        // require the merged leaf to hold every entry the verified source has; the
+        // overlay is a superset of the upperdir (barring whiteouts, which fresh
+        // downloads never have), so a missing entry means the listing is stale.
+        // (`cur` is the merged leaf when `fully_present`; short-circuit so we don't
+        // read a partial path when an ancestor never resolved.)
+        let leaf_reflects_source = fully_present && {
+            let overlay: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(&cur)
+                .map(|e| e.filter_map(Result::ok).map(|d| d.file_name()).collect())
+                .unwrap_or_default();
+            std::fs::read_dir(source_path)
+                .map(|src| src.filter_map(Result::ok).all(|d| overlay.contains(&d.file_name())))
+                .unwrap_or(true) // source unreadable → don't force a drop
+        };
+
+        if leaf_reflects_source {
             debug!("Refreshed overlay cache along path: {}", overlay_path.display());
             return;
         }
 
-        // The path still doesn't resolve after re-reading every existing ancestor —
-        // the overlay's directory cache is poisoned (a negative dentry was cached
-        // while the content was still absent, before this fix or by another reader).
-        // `read_dir` can't evict that, so drop the VFS dentry/inode caches as a last
-        // resort. Rare (only genuinely-stuck brand-new trees) and coalesced by the
-        // dedupe window above.
+        // Either an ancestor never resolved, or the leaf's contents are stale — the
+        // overlay's directory cache is poisoned (a negative or empty listing was cached
+        // while the content was still absent) and a re-read can't evict it. Drop the
+        // VFS dentry/inode caches as a last resort. Rare (only genuinely-stuck brand-new
+        // trees or a release dir written after its empty parent was cached) and coalesced
+        // by the dedupe window above.
         warn!("Overlay still stale for {} after re-read — dropping VFS caches to surface it", overlay_path.display());
         Self::drop_vfs_caches();
     }
