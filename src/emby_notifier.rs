@@ -51,6 +51,17 @@ struct EmbyItem {
     item_type: Option<String>,
 }
 
+/// Emby's unfiltered `/Items?Recursive=true` also returns generic filesystem-browse
+/// "Folder" nodes alongside real library items (Movie/Series/Season/CollectionFolder) — a
+/// parallel, non-scanning view of the same paths, distinct from the actual library.
+/// `POST /Items/{id}/Refresh` against one of these returns success (204) but never triggers
+/// real content discovery, so a path match against a "Folder" node silently no-ops instead
+/// of surfacing new media. Excluded from the items cache so every match (direct or
+/// parent-walk) can only land on an item that actually participates in library scanning.
+fn is_scannable_item_type(item_type: Option<&str>) -> bool {
+    item_type != Some("Folder")
+}
+
 /// Configuration needed by the notifier.
 ///
 /// URLs that are stable across all calls are pre-built at construction time so that
@@ -420,6 +431,7 @@ impl EmbyNotifier {
             .items
             .into_iter()
             .filter(|item| item.path.is_some())
+            .filter(|item| is_scannable_item_type(item.item_type.as_deref()))
             .collect();
 
         Ok(items)
@@ -636,6 +648,29 @@ mod tests {
         let unmapped = PathBuf::from("/other/location/file.mkv");
         let result = translate_path(&unmapped, &mapping, "Emby");
         assert_eq!(result, unmapped);
+    }
+
+    #[test]
+    fn scannable_item_type_excludes_generic_folder_nodes() {
+        // The exact failure mode: Emby's unfiltered /Items listing includes a "Folder"
+        // browse node at the same path as the real library — refreshing it is a silent
+        // no-op (200/204) that never discovers new content, so it must never survive
+        // into the items cache used for path matching.
+        assert!(!is_scannable_item_type(Some("Folder")));
+    }
+
+    #[test]
+    fn scannable_item_type_keeps_real_library_items() {
+        for t in ["Movie", "Series", "Season", "Episode", "CollectionFolder"] {
+            assert!(is_scannable_item_type(Some(t)), "{t} should be scannable");
+        }
+    }
+
+    #[test]
+    fn scannable_item_type_keeps_unknown_type() {
+        // Missing/unrecognized Type is permissive (only the known-bad "Folder" is denied) —
+        // an item with no Type at all should not be silently dropped from matching.
+        assert!(is_scannable_item_type(None));
     }
 
     #[tokio::test]
