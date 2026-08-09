@@ -17,6 +17,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_NAME="rargate"
 RARGATE_MOUNT="/mnt/user/rargate"
+RARGATE_CONFIG="/etc/rargate/config.yaml"
 # shellcheck disable=SC1091
 source /var/run/rargate-paths.conf 2>/dev/null || true
 # RARGATE_MOUNT is overridden by the conf if present.
@@ -105,8 +106,13 @@ if [ -f "/usr/local/bin/rargate" ]; then
             sleep 1
         fi
 
-        # Kill any lingering processes
-        pkill -9 -f "^/usr/local/bin/rargate" 2>/dev/null || true
+        # Kill any lingering processes. Anchored to this exact invocation
+        # (binary + --config path), not just the binary path -- if more than
+        # one rargate process is ever running from a different --config (the
+        # same binary, just pointed at a different config file), a bare
+        # "^/usr/local/bin/rargate" prefix match would kill all of them, not
+        # just the one actually being replaced.
+        pkill -9 -f "^/usr/local/bin/rargate --config ${RARGATE_CONFIG}\$" 2>/dev/null || true
         sleep 1
     fi
 fi
