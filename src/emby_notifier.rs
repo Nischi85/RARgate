@@ -21,7 +21,7 @@ use crate::metrics::MetricsCollector;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -62,6 +62,39 @@ fn is_scannable_item_type(item_type: Option<&str>) -> bool {
     item_type != Some("Folder")
 }
 
+/// A library from Emby/Jellyfin's `/Library/VirtualFolders` — the actual CollectionFolder
+/// a user configured (Movies, TV Shows, Documentaries, ...), each covering one or more
+/// filesystem locations. Distinct from `EmbyItem`: these never appear in a plain
+/// `/Items?Recursive=true` listing (that enumerates a library's *children*, not the
+/// library roots themselves), so resolving one requires this separate endpoint.
+#[derive(Debug, Clone, Deserialize)]
+struct VirtualFolder {
+    #[serde(rename = "ItemId")]
+    item_id: String,
+    #[serde(rename = "Locations", default)]
+    locations: Vec<String>,
+}
+
+/// Resolve the library that owns `path` by longest-prefix match against each configured
+/// library's locations. A direct, targeted refresh of the real library (unlike a stale
+/// "Folder" browse node, or the path-based `/Library/Media/Updated` notification — which
+/// always reports success but has been observed to silently do nothing for a library with
+/// EnableRealtimeMonitor off) reliably discovers new content regardless of that setting.
+fn find_library_for_path(path: &Path, folders: &[VirtualFolder]) -> Option<String> {
+    folders
+        .iter()
+        .filter_map(|f| {
+            f.locations
+                .iter()
+                .filter(|loc| path.starts_with(Path::new(loc.as_str())))
+                .map(|loc| loc.len())
+                .max()
+                .map(|best_len| (best_len, &f.item_id))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, id)| id.clone())
+}
+
 /// Configuration needed by the notifier.
 ///
 /// URLs that are stable across all calls are pre-built at construction time so that
@@ -81,6 +114,8 @@ struct NotifierConfig {
     // Pre-built URLs — computed once in new_internal(), named by purpose
     /// GET all library items with paths (used to refresh the item cache)
     fetch_items_url: String,
+    /// GET configured libraries (Movies, TV Shows, ...) and their filesystem locations
+    virtual_folders_url: String,
     /// POST path-based Created/Deleted notifications
     notify_path_url: String,
     /// POST to trigger a full library rescan (fallback only)
@@ -99,6 +134,7 @@ pub struct EmbyNotifier {
     client: reqwest::Client,
     receiver: mpsc::Receiver<MediaEvent>,
     items_cache: ItemCache<EmbyItem>,
+    virtual_folders_cache: ItemCache<VirtualFolder>,
     metrics: Option<Arc<MetricsCollector>>,
     /// Tracks when the last full library refresh was triggered (for cooldown enforcement)
     last_full_refresh: Option<Instant>,
@@ -126,6 +162,7 @@ impl EmbyNotifier {
         let base = format!("{}{}", config.url, api_prefix);
         let token = &config.api_token;
         let fetch_items_url    = format!("{}/Items?Recursive=true&Fields=Path,Name&api_key={}", base, token);
+        let virtual_folders_url = format!("{}/Library/VirtualFolders?api_key={}", base, token);
         let notify_path_url    = format!("{}/Library/Media/Updated?api_key={}", base, token);
         let full_library_url   = format!("{}/Library/Refresh?api_key={}", base, token);
         let item_refresh_base  = format!("{}/Items/", base);
@@ -142,6 +179,7 @@ impl EmbyNotifier {
             max_retries: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             retry_delay_ms: config.retry_delay_ms.unwrap_or(DEFAULT_RETRY_DELAY_MS),
             fetch_items_url,
+            virtual_folders_url,
             notify_path_url,
             full_library_url,
             item_refresh_base,
@@ -154,6 +192,7 @@ impl EmbyNotifier {
             client,
             receiver,
             items_cache: ItemCache::new(cache_minutes),
+            virtual_folders_cache: ItemCache::new(cache_minutes),
             metrics: None,
             last_full_refresh: None,
         };
@@ -241,12 +280,52 @@ impl EmbyNotifier {
                 return Ok(());
             }
 
-            // No parent found either — fall back to path-based notification
-            let container_paths: Vec<PathBuf> = target_dirs.iter()
-                .map(|p| translate_path(p, &self.config.path_mapping, server_name))
-                .collect();
+            // No parent item found either (genuinely new content, no existing sibling
+            // under this library to match against) — resolve the owning library itself
+            // via /Library/VirtualFolders and refresh it directly. A targeted library
+            // refresh reliably discovers new content regardless of whether that library
+            // has EnableRealtimeMonitor on; the path-based notification below always
+            // reports success but has been observed to silently do nothing for a
+            // library where that setting is off, so relying on it alone leaves any
+            // library besides the ones with monitoring enabled never actually picking
+            // up new content.
+            let virtual_folders = match self.get_virtual_folders_cache().await {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("{}: Failed to fetch virtual folders: {}", server_name, e);
+                    Vec::new()
+                }
+            };
 
-            info!("{}: No matching items or parents found - using path-based notification for {} paths",
+            let mut container_paths: Vec<PathBuf> = Vec::new();
+            let mut libraries_to_refresh: HashSet<String> = HashSet::new();
+            for dir in &target_dirs {
+                let container_path = translate_path(dir, &self.config.path_mapping, server_name);
+                match find_library_for_path(&container_path, &virtual_folders) {
+                    Some(library_id) => { libraries_to_refresh.insert(library_id); }
+                    None => container_paths.push(container_path),
+                }
+            }
+
+            if !libraries_to_refresh.is_empty() {
+                info!("{}: Refreshing {} owning librar{} for new content",
+                      server_name, libraries_to_refresh.len(),
+                      if libraries_to_refresh.len() == 1 { "y" } else { "ies" });
+                for library_id in &libraries_to_refresh {
+                    if let Err(e) = self.refresh_item(library_id, "Library", "CollectionFolder").await {
+                        error!("{}: Failed to refresh library {}: {}", server_name, library_id, e);
+                    }
+                }
+                self.items_cache.invalidate().await;
+            }
+
+            if container_paths.is_empty() {
+                return Ok(());
+            }
+
+            // Remaining paths matched no known library either — fall back to
+            // path-based notification.
+            info!("{}: No matching items, parents, or libraries found - using path-based notification for {} paths",
                   server_name, container_paths.len());
 
             for path in &container_paths {
@@ -435,6 +514,36 @@ impl EmbyNotifier {
             .collect();
 
         Ok(items)
+    }
+
+    async fn get_virtual_folders_cache(&self) -> Result<Vec<VirtualFolder>> {
+        self.virtual_folders_cache.get_or_fetch(|| async {
+            self.fetch_virtual_folders().await
+        }).await
+    }
+
+    /// Fetch the server's configured libraries and their filesystem locations.
+    /// `/Library/VirtualFolders` returns a bare JSON array (unlike `/Items`, which wraps
+    /// results in `{"Items": [...]}`).
+    async fn fetch_virtual_folders(&self) -> Result<Vec<VirtualFolder>> {
+        let url = &self.config.virtual_folders_url;
+        debug!("{}: Fetching virtual folders (libraries)", self.config.server_name);
+
+        let response = self.client
+            .get(url)
+            .send()
+            .await
+            .context(format!("Failed to fetch virtual folders from {} API", self.config.server_name))?;
+
+        let body = response
+            .text()
+            .await
+            .context(format!("Failed to read {} virtual folders response body", self.config.server_name))?;
+
+        let folders: Vec<VirtualFolder> = serde_json::from_str(&body)
+            .context(format!("Failed to parse {} virtual folders response", self.config.server_name))?;
+
+        Ok(folders)
     }
 
     /// Trigger a refresh for a specific item
@@ -671,6 +780,42 @@ mod tests {
         // Missing/unrecognized Type is permissive (only the known-bad "Folder" is denied) —
         // an item with no Type at all should not be silently dropped from matching.
         assert!(is_scannable_item_type(None));
+    }
+
+    fn vfolder(item_id: &str, locations: &[&str]) -> VirtualFolder {
+        VirtualFolder {
+            item_id: item_id.to_string(),
+            locations: locations.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn library_lookup_matches_the_owning_library() {
+        let folders = vec![
+            vfolder("7", &["/share/Movies", "/share/Elvis/Movies.starring.Elvis"]),
+            vfolder("475592", &["/share/Documentaries/Movies"]),
+        ];
+        let path = PathBuf::from("/share/Documentaries/Movies/Some.Doc.2026-GROUP");
+        assert_eq!(find_library_for_path(&path, &folders), Some("475592".to_string()));
+    }
+
+    #[test]
+    fn library_lookup_picks_longest_matching_location() {
+        // A library covering multiple locations, one nested under a shallower path from
+        // a different library — the more specific (longer) match must win.
+        let folders = vec![
+            vfolder("1", &["/share"]),
+            vfolder("2", &["/share/Movies"]),
+        ];
+        let path = PathBuf::from("/share/Movies/Some.Movie.2026-GROUP");
+        assert_eq!(find_library_for_path(&path, &folders), Some("2".to_string()));
+    }
+
+    #[test]
+    fn library_lookup_none_for_unconfigured_path() {
+        let folders = vec![vfolder("7", &["/share/Movies"])];
+        let path = PathBuf::from("/share/Music/Some.Album");
+        assert_eq!(find_library_for_path(&path, &folders), None);
     }
 
     #[tokio::test]
