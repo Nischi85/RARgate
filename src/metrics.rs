@@ -57,6 +57,9 @@ pub struct MetricsCollector {
     pub jellyfin_full_refreshes: AtomicU64,
     pub plex_full_refreshes: AtomicU64,
     pub full_refresh_cooldown_skips: AtomicU64,
+    /// New content notified via targeted path-based `/Library/Media/Updated` instead of
+    /// a whole-library refresh (only possible on libraries with EnableRealtimeMonitor on).
+    pub emby_targeted_new_content_notifies: AtomicU64,
 
     // Filter cache
     pub cache_hits: AtomicU64,
@@ -95,6 +98,7 @@ impl MetricsCollector {
             jellyfin_full_refreshes: AtomicU64::new(0),
             plex_full_refreshes: AtomicU64::new(0),
             full_refresh_cooldown_skips: AtomicU64::new(0),
+            emby_targeted_new_content_notifies: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             rar2fs_limiter_blocked_acquires: AtomicU64::new(0),
@@ -219,7 +223,8 @@ impl MetricsCollector {
     "emby_full_refreshes": {emby_fr},
     "jellyfin_full_refreshes": {jf_fr},
     "plex_full_refreshes": {plex_fr},
-    "full_refresh_cooldown_skips": {cooldown_skips}
+    "full_refresh_cooldown_skips": {cooldown_skips},
+    "emby_targeted_new_content_notifies": {emby_targeted}
   }},
   "filter_cache": {{
     "hits": {hits},
@@ -253,6 +258,7 @@ impl MetricsCollector {
             jf_fr = self.jellyfin_full_refreshes.load(Ordering::Relaxed),
             plex_fr = self.plex_full_refreshes.load(Ordering::Relaxed),
             cooldown_skips = self.full_refresh_cooldown_skips.load(Ordering::Relaxed),
+            emby_targeted = self.emby_targeted_new_content_notifies.load(Ordering::Relaxed),
             hits = hits,
             misses = misses,
             cache_hit_rate = cache_hit_rate,

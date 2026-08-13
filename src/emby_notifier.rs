@@ -62,6 +62,13 @@ fn is_scannable_item_type(item_type: Option<&str>) -> bool {
     item_type != Some("Folder")
 }
 
+/// The subset of a library's settings we care about from `/Library/VirtualFolders`.
+#[derive(Debug, Clone, Deserialize)]
+struct LibraryOptions {
+    #[serde(rename = "EnableRealtimeMonitor", default)]
+    enable_realtime_monitor: bool,
+}
+
 /// A library from Emby/Jellyfin's `/Library/VirtualFolders` — the actual CollectionFolder
 /// a user configured (Movies, TV Shows, Documentaries, ...), each covering one or more
 /// filesystem locations. Distinct from `EmbyItem`: these never appear in a plain
@@ -73,14 +80,26 @@ struct VirtualFolder {
     item_id: String,
     #[serde(rename = "Locations", default)]
     locations: Vec<String>,
+    #[serde(rename = "LibraryOptions", default)]
+    library_options: Option<LibraryOptions>,
+}
+
+impl VirtualFolder {
+    /// Missing/absent options are treated as monitor-off — the cost of a false negative
+    /// here is just an extra whole-library refresh, while a false positive would silently
+    /// lose the new item (the exact bug this field exists to avoid).
+    fn realtime_monitor_enabled(&self) -> bool {
+        self.library_options.as_ref().is_some_and(|o| o.enable_realtime_monitor)
+    }
 }
 
 /// Resolve the library that owns `path` by longest-prefix match against each configured
-/// library's locations. A direct, targeted refresh of the real library (unlike a stale
-/// "Folder" browse node, or the path-based `/Library/Media/Updated` notification — which
-/// always reports success but has been observed to silently do nothing for a library with
-/// EnableRealtimeMonitor off) reliably discovers new content regardless of that setting.
-fn find_library_for_path(path: &Path, folders: &[VirtualFolder]) -> Option<String> {
+/// library's locations, along with whether that library has EnableRealtimeMonitor on.
+/// A direct, targeted refresh of the real library (unlike a stale "Folder" browse node)
+/// reliably discovers new content regardless of that setting — but when it IS on, the much
+/// cheaper path-based `/Library/Media/Updated` notification works too, so callers can use
+/// the monitor flag to pick the lighter option where it's known to actually work.
+fn find_library_for_path(path: &Path, folders: &[VirtualFolder]) -> Option<(String, bool)> {
     folders
         .iter()
         .filter_map(|f| {
@@ -89,10 +108,10 @@ fn find_library_for_path(path: &Path, folders: &[VirtualFolder]) -> Option<Strin
                 .filter(|loc| path.starts_with(Path::new(loc.as_str())))
                 .map(|loc| loc.len())
                 .max()
-                .map(|best_len| (best_len, &f.item_id))
+                .map(|best_len| (best_len, &f.item_id, f.realtime_monitor_enabled()))
         })
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, id)| id.clone())
+        .max_by_key(|(len, _, _)| *len)
+        .map(|(_, id, monitor)| (id.clone(), monitor))
 }
 
 /// Configuration needed by the notifier.
@@ -282,13 +301,12 @@ impl EmbyNotifier {
 
             // No parent item found either (genuinely new content, no existing sibling
             // under this library to match against) — resolve the owning library itself
-            // via /Library/VirtualFolders and refresh it directly. A targeted library
-            // refresh reliably discovers new content regardless of whether that library
-            // has EnableRealtimeMonitor on; the path-based notification below always
-            // reports success but has been observed to silently do nothing for a
-            // library where that setting is off, so relying on it alone leaves any
-            // library besides the ones with monitoring enabled never actually picking
-            // up new content.
+            // via /Library/VirtualFolders. Libraries with EnableRealtimeMonitor on get
+            // the cheap path-based notification, scoped to just the new item's own path
+            // (Emby actually picks these up when that setting is on); everything else
+            // gets the reliable whole-library refresh, since the path-based notification
+            // always reports success but has been observed to silently do nothing for a
+            // library where that setting is off.
             let virtual_folders = match self.get_virtual_folders_cache().await {
                 Ok(f) => f,
                 Err(e) => {
@@ -298,12 +316,32 @@ impl EmbyNotifier {
             };
 
             let mut container_paths: Vec<PathBuf> = Vec::new();
+            let mut monitor_on_paths: Vec<(PathBuf, String)> = Vec::new();
             let mut libraries_to_refresh: HashSet<String> = HashSet::new();
             for dir in &target_dirs {
                 let container_path = translate_path(dir, &self.config.path_mapping, server_name);
                 match find_library_for_path(&container_path, &virtual_folders) {
-                    Some(library_id) => { libraries_to_refresh.insert(library_id); }
+                    Some((library_id, true)) => monitor_on_paths.push((container_path, library_id)),
+                    Some((library_id, false)) => { libraries_to_refresh.insert(library_id); }
                     None => container_paths.push(container_path),
+                }
+            }
+
+            if !monitor_on_paths.is_empty() {
+                let paths: Vec<PathBuf> = monitor_on_paths.iter().map(|(p, _)| p.clone()).collect();
+                info!("{}: Notifying {} new path(s) directly (owning librar{} has real-time monitoring on)",
+                      server_name, paths.len(), if paths.len() == 1 { "y" } else { "ies" });
+                if let Err(e) = self.notify_media_updated(&paths, "Created").await {
+                    error!("{}: Targeted path notification failed, falling back to library refresh: {}",
+                           server_name, e);
+                    for (_, library_id) in &monitor_on_paths {
+                        libraries_to_refresh.insert(library_id.clone());
+                    }
+                } else {
+                    self.items_cache.invalidate().await;
+                    if let Some(m) = &self.metrics {
+                        m.emby_targeted_new_content_notifies.fetch_add(paths.len() as u64, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -783,9 +821,14 @@ mod tests {
     }
 
     fn vfolder(item_id: &str, locations: &[&str]) -> VirtualFolder {
+        vfolder_with_monitor(item_id, locations, false)
+    }
+
+    fn vfolder_with_monitor(item_id: &str, locations: &[&str], realtime_monitor: bool) -> VirtualFolder {
         VirtualFolder {
             item_id: item_id.to_string(),
             locations: locations.iter().map(|s| s.to_string()).collect(),
+            library_options: Some(LibraryOptions { enable_realtime_monitor: realtime_monitor }),
         }
     }
 
@@ -796,7 +839,7 @@ mod tests {
             vfolder("475592", &["/share/Documentaries/Movies"]),
         ];
         let path = PathBuf::from("/share/Documentaries/Movies/Some.Doc.2026-GROUP");
-        assert_eq!(find_library_for_path(&path, &folders), Some("475592".to_string()));
+        assert_eq!(find_library_for_path(&path, &folders), Some(("475592".to_string(), false)));
     }
 
     #[test]
@@ -808,7 +851,7 @@ mod tests {
             vfolder("2", &["/share/Movies"]),
         ];
         let path = PathBuf::from("/share/Movies/Some.Movie.2026-GROUP");
-        assert_eq!(find_library_for_path(&path, &folders), Some("2".to_string()));
+        assert_eq!(find_library_for_path(&path, &folders), Some(("2".to_string(), false)));
     }
 
     #[test]
@@ -816,6 +859,35 @@ mod tests {
         let folders = vec![vfolder("7", &["/share/Movies"])];
         let path = PathBuf::from("/share/Music/Some.Album");
         assert_eq!(find_library_for_path(&path, &folders), None);
+    }
+
+    #[test]
+    fn library_lookup_surfaces_realtime_monitor_flag() {
+        let folders = vec![
+            vfolder_with_monitor("1", &["/share/Movies"], true),
+            vfolder("2", &["/share/TV Shows"]),
+        ];
+        assert_eq!(
+            find_library_for_path(&PathBuf::from("/share/Movies/New.Movie.2026"), &folders),
+            Some(("1".to_string(), true)),
+        );
+        assert_eq!(
+            find_library_for_path(&PathBuf::from("/share/TV Shows/New.Show"), &folders),
+            Some(("2".to_string(), false)),
+        );
+    }
+
+    #[test]
+    fn library_lookup_treats_missing_library_options_as_monitor_off() {
+        let folders = vec![VirtualFolder {
+            item_id: "3".to_string(),
+            locations: vec!["/share/Movies".to_string()],
+            library_options: None,
+        }];
+        assert_eq!(
+            find_library_for_path(&PathBuf::from("/share/Movies/New.Movie.2026"), &folders),
+            Some(("3".to_string(), false)),
+        );
     }
 
     #[tokio::test]
