@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
     if let Err(e) = utils::write_monitor_conf(&config) {
         warn!("write_monitor_conf failed: {}", e);
     }
-    if let Err(e) = utils::write_paths_conf(&config) {
+    if let Err(e) = utils::write_paths_conf(&config, &cli.config) {
         warn!("write_paths_conf failed: {}", e);
     }
 

@@ -267,11 +267,17 @@ pub fn write_monitor_conf(config: &crate::config::Config) -> Result<()> {
     }
 }
 
-/// Write the paths file at /var/run/rargate-paths.conf. Sourced by all
-/// deploy bash scripts (startup, shutdown, monitor) so they read mount
-/// paths from config.yaml instead of duplicating them. Single source of
-/// truth lives in the YAML.
-pub fn write_paths_conf(config: &crate::config::Config) -> Result<()> {
+/// Write the paths file sourced by the deploy bash scripts (startup,
+/// shutdown, monitor) so they read mount paths from config.yaml instead of
+/// duplicating them. Single source of truth lives in the YAML.
+///
+/// The filename is derived from the config file's stem so that separate
+/// rargate instances (e.g. config.yaml / config-stuff.yaml) each get their
+/// own conf file instead of racing to overwrite a single shared one —
+/// config.yaml keeps the legacy /var/run/rargate-paths.conf name (every
+/// consuming script already hardcodes that default for the main instance);
+/// config-<suffix>.yaml gets /var/run/rargate-paths-<suffix>.conf.
+pub fn write_paths_conf(config: &crate::config::Config, config_path: &std::path::Path) -> Result<()> {
     use std::io::Write;
 
     fn pb(p: &std::path::Path) -> String { p.to_string_lossy().into_owned() }
@@ -319,8 +325,15 @@ pub fn write_paths_conf(config: &crate::config::Config) -> Result<()> {
          CORE_DUMP_KEEP={core_dump_keep}\n",
     );
 
-    let path = "/var/run/rargate-paths.conf";
-    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path) {
+    let stem = config_path.file_stem().and_then(|s| s.to_str()).unwrap_or("config");
+    let suffix = stem.strip_prefix("config").unwrap_or(stem);
+    let filename = if suffix.is_empty() {
+        "rargate-paths.conf".to_string()
+    } else {
+        format!("rargate-paths{suffix}.conf")
+    };
+    let path = format!("/var/run/{filename}");
+    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
         Ok(mut f) => {
             f.write_all(contents.as_bytes())?;
             tracing::info!("Wrote paths config to {}", path);
