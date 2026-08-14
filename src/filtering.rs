@@ -50,6 +50,8 @@ pub struct HotConfig {
     pub media_extensions: Arc<HashSet<String>>,
     pub exclude_file_matchers: Arc<Vec<WildMatch>>,
     pub exclude_dir_patterns_lower: Arc<HashSet<String>>,
+    /// Lowercased `include_dirs` whitelist. Empty = no restriction (show everything at root).
+    pub include_dirs_lower: Arc<HashSet<String>>,
 }
 
 /// Handle returned by `FilterEngine::new()` for reloading hot configuration on SIGHUP.
@@ -129,6 +131,12 @@ impl HotConfig {
             .map(|patterns| patterns.iter().map(|p| p.to_lowercase()).collect())
             .unwrap_or_default();
 
+        let include_dirs_lower: HashSet<String> = config.filters
+            .as_ref()
+            .and_then(|f| f.include_dirs.as_ref())
+            .map(|names| names.iter().map(|n| n.to_lowercase()).collect())
+            .unwrap_or_default();
+
         let download_threshold_secs = config.sfv_validation
             .as_ref()
             .and_then(|s| s.download_threshold_seconds)
@@ -141,6 +149,7 @@ impl HotConfig {
             media_extensions: Arc::new(media_extensions),
             exclude_file_matchers: Arc::new(exclude_file_matchers),
             exclude_dir_patterns_lower: Arc::new(exclude_dir_patterns_lower),
+            include_dirs_lower: Arc::new(include_dirs_lower),
         }
     }
 }
@@ -269,6 +278,40 @@ impl FilterEngine {
 
         let mut results = HashMap::new();
 
+        // include_dirs whitelist only applies at the mount root — a whitelist of
+        // top-level category names (e.g. "Movies", "TV Shows") has no meaning for
+        // filtering season/episode subdirectories further down the tree.
+        if parent_path == self.backend_path.as_path() {
+            let include_dirs_lower = self.hot.read().unwrap().include_dirs_lower.clone();
+            if !include_dirs_lower.is_empty() {
+                let mut kept = Vec::with_capacity(dirnames.len());
+                for dirname in dirnames {
+                    if include_dirs_lower.contains(&dirname.to_lowercase()) {
+                        kept.push(dirname.clone());
+                    } else {
+                        debug!("FILTERED: Directory '{}' not in include_dirs whitelist", dirname);
+                        results.insert(dirname.clone(), false);
+                    }
+                }
+                return self.should_show_directories_parallel_inner(parent_path, &kept, results);
+            }
+        }
+
+        self.should_show_directories_parallel_inner(parent_path, dirnames, results)
+    }
+
+    /// The pre-include_dirs body of `should_show_directories_parallel`, taking an
+    /// already-partially-filled `results` map (entries the whitelist check rejected)
+    /// so directories excluded by `include_dirs` skip SFV/exclude-pattern validation
+    /// entirely instead of paying for a rar2fs probe that can never change the outcome.
+    fn should_show_directories_parallel_inner(
+        &self,
+        parent_path: &Path,
+        dirnames: &[String],
+        mut results: std::collections::HashMap<String, bool>,
+    ) -> std::collections::HashMap<String, bool> {
+        use std::collections::HashMap;
+
         // Check if SFV validation is enabled — read once, drop lock
         let (sfv_enabled, lazy_mode) = {
             let hot = self.hot.read().unwrap();
@@ -314,7 +357,9 @@ impl FilterEngine {
                self.validation_pool.current_num_threads(), PARALLEL_THRESHOLD);
 
         // THROTTLING: Use custom thread pool instead of global Rayon pool
-        let results: HashMap<String, bool> = self.validation_pool.install(|| {
+        // Extends (not replaces) `results`: any include_dirs rejections already in
+        // there from the caller must survive alongside the parallel-computed ones.
+        results.extend(self.validation_pool.install(|| -> HashMap<String, bool> {
             dirnames
                 .par_iter()
                 .map(|dirname| {
@@ -327,7 +372,7 @@ impl FilterEngine {
                     (dirname.clone(), should_show)
                 })
                 .collect()
-        });
+        }));
 
         results
     }
@@ -792,5 +837,96 @@ impl FilterEngine {
             }
         }
     }
-    
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Rar2fsConfig};
+
+    fn test_config(include_dirs: Option<Vec<String>>) -> Config {
+        Config {
+            source: PathBuf::from("/test/source"),
+            mountpoint: PathBuf::from("/test/mount"),
+            verbose: None,
+            daemon: false,
+            read_only: None,
+            no_delete: None,
+            rar2fs: Rar2fsConfig {
+                binary_path: None,
+                backend_mount: None,
+                seek_length: None,
+                extra_options: None,
+                max_concurrent_reads: None,
+            },
+            sfv_validation: None, // disabled: keeps should_show_directories_parallel on the
+                                   // basic-filter-only path, so tests need no real filesystem.
+            filters: Some(FiltersConfig {
+                exclude_dirs: None,
+                exclude_files: None,
+                media_extensions: None,
+                rar_archives: None,
+                include_dirs,
+            }),
+            overlay_reference: None,
+            unionfs_reference: None,
+            notifications: None,
+            crash_recovery: None,
+            watcher: None,
+            emby: None,
+            jellyfin: None,
+            plex: None,
+            arr: None,
+            fuse_options: None,
+            logging: None,
+            metrics: None,
+            core_dumps: None,
+        }
+    }
+
+    fn test_engine(include_dirs: Option<Vec<String>>) -> FilterEngine {
+        let backend_path = PathBuf::from("/test/backend");
+        let config = test_config(include_dirs);
+        let limiter = RarFsLimiter::new(1);
+        FilterEngine::new(backend_path, config, limiter).unwrap().0
+    }
+
+    #[test]
+    fn include_dirs_whitelist_filters_at_mount_root() {
+        let engine = test_engine(Some(vec!["Movies".to_string(), "TV Shows".to_string()]));
+        let root = PathBuf::from("/test/backend");
+        let dirs = vec!["Movies".to_string(), "Backups".to_string(), "tv shows".to_string()];
+
+        let results = engine.should_show_directories_parallel(&root, &dirs);
+
+        assert_eq!(results.get("Movies"), Some(&true));
+        assert_eq!(results.get("Backups"), Some(&false), "not in whitelist, must be hidden");
+        assert_eq!(results.get("tv shows"), Some(&true), "whitelist match must be case-insensitive");
+    }
+
+    #[test]
+    fn include_dirs_whitelist_does_not_apply_below_mount_root() {
+        let engine = test_engine(Some(vec!["Movies".to_string()]));
+        // A subdirectory listing (e.g. inside "Movies") must not be filtered by a
+        // whitelist meant for top-level category names.
+        let subdir = PathBuf::from("/test/backend/Movies");
+        let dirs = vec!["Some.Movie.2024".to_string()];
+
+        let results = engine.should_show_directories_parallel(&subdir, &dirs);
+
+        assert_eq!(results.get("Some.Movie.2024"), Some(&true));
+    }
+
+    #[test]
+    fn absent_include_dirs_shows_everything_at_root() {
+        let engine = test_engine(None);
+        let root = PathBuf::from("/test/backend");
+        let dirs = vec!["Movies".to_string(), "Anything".to_string()];
+
+        let results = engine.should_show_directories_parallel(&root, &dirs);
+
+        assert_eq!(results.get("Movies"), Some(&true));
+        assert_eq!(results.get("Anything"), Some(&true));
+    }
 }

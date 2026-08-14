@@ -91,6 +91,9 @@ pub struct ValidationBackoffConfig {
 pub struct FiltersConfig {
     pub exclude_dirs: Option<Vec<String>>,
     pub exclude_files: Option<Vec<String>>,
+    /// Whitelist of top-level directory names to expose; everything else at the mount
+    /// root is hidden regardless of SFV state. Empty/absent = no restriction (default).
+    pub include_dirs: Option<Vec<String>>,
     /// Valid media file extensions (without dots) for RAR extraction and Emby notifications
     /// Default: mkv, mp4, avi, m4v, mov, wmv, flv, mpg, mpeg, mp3, flac, m4a, wav, aac, ogg, wma, iso, img, bin, cue
     pub media_extensions: Option<Vec<String>>,
