@@ -144,12 +144,25 @@ impl RarGateFs {
     }
 
     fn backend_path(&self, path: &str) -> PathBuf {
-        let path = path.strip_prefix('/').unwrap_or(path);
-        self.backend_path.join(path)
+        self.backend_path_for(Path::new(path))
     }
 
     fn source_path(&self, path: &str) -> PathBuf {
-        let path = path.strip_prefix('/').unwrap_or(path);
+        self.source_path_for(Path::new(path))
+    }
+
+    /// `&Path`-taking twin of `backend_path` — callers that already hold a `Path`/`PathBuf`
+    /// (the common case: most FUSE callbacks build one via `parent.join(name)` before
+    /// resolving it) use this instead of `backend_path(&p.to_string_lossy())`, which
+    /// allocates a throwaway `String` just to immediately rebuild a `PathBuf` from it.
+    fn backend_path_for(&self, path: &Path) -> PathBuf {
+        let path = path.strip_prefix("/").unwrap_or(path);
+        self.backend_path.join(path)
+    }
+
+    /// `&Path`-taking twin of `source_path` — see `backend_path_for`.
+    fn source_path_for(&self, path: &Path) -> PathBuf {
+        let path = path.strip_prefix("/").unwrap_or(path);
         self.source_path.join(path)
     }
 
@@ -161,7 +174,7 @@ impl RarGateFs {
     /// headers). Settled directories are fast-pathed by mtime so the stable library
     /// pays only a single `stat` per entry.
     fn source_set_incomplete(&self, relative_path: &Path) -> bool {
-        let source_dir = self.source_path(&relative_path.to_string_lossy());
+        let source_dir = self.source_path_for(relative_path);
         if let Ok(md) = std::fs::metadata(&source_dir) {
             if let Ok(modified) = md.modified() {
                 if let Ok(elapsed) = modified.elapsed() {
@@ -257,7 +270,7 @@ impl RarGateFs {
             return Err(libc::EROFS);
         }
 
-        Ok(self.source_path(&child_path.to_string_lossy()))
+        Ok(self.source_path_for(&child_path))
     }
 
     /// Check if a path contains RAR-extracted content (read-only protection)
@@ -330,7 +343,7 @@ impl RarGateFs {
             (Some(par), Some(name)) => (par, name.to_string_lossy().to_lowercase()),
             _ => return false,
         };
-        let source_parent = self.source_path(&parent.to_string_lossy());
+        let source_parent = self.source_path_for(parent);
         let sfv_path = match find_sfv_in(&source_parent) {
             Some(s) => s,
             None => return false,
@@ -379,7 +392,7 @@ impl Filesystem for RarGateFs {
         let name_str = name.to_string_lossy();
 
         // Compute backend path for parent directory (for SFV validation)
-        let parent_backend_path = self.backend_path(&parent_path.to_string_lossy());
+        let parent_backend_path = self.backend_path_for(&parent_path);
 
         // Check if file should be shown based on filters
         if !self.filter_engine.should_show_file(&parent_backend_path, &name_str) {
@@ -395,7 +408,7 @@ impl Filesystem for RarGateFs {
             return;
         }
 
-        let backend_path = self.backend_path(&child_path.to_string_lossy());
+        let backend_path = self.backend_path_for(&child_path);
 
         match std::fs::metadata(&backend_path) {
             Ok(metadata) => {
@@ -429,7 +442,7 @@ impl Filesystem for RarGateFs {
         // backend so rar2fs isn't asked to parse partial volumes. readdir/lookup
         // already hide these; this covers a cached inode being re-stat'd.
         if self.source_set_incomplete(&path) {
-            let source_path = self.source_path(&path.to_string_lossy());
+            let source_path = self.source_path_for(&path);
             match std::fs::metadata(&source_path) {
                 Ok(metadata) => {
                     let file_type = if metadata.is_dir() {
@@ -447,7 +460,7 @@ impl Filesystem for RarGateFs {
             return;
         }
 
-        let backend_path = self.backend_path(&path.to_string_lossy());
+        let backend_path = self.backend_path_for(&path);
 
         match std::fs::metadata(&backend_path) {
             Ok(metadata) => {
@@ -487,7 +500,7 @@ impl Filesystem for RarGateFs {
             }
         };
 
-        let backend_path = self.backend_path(&path.to_string_lossy());
+        let backend_path = self.backend_path_for(&path);
 
         let after_path_resolve = Instant::now();
 
@@ -641,7 +654,7 @@ impl Filesystem for RarGateFs {
             }
         };
 
-        let backend_path = self.backend_path(&path.to_string_lossy());
+        let backend_path = self.backend_path_for(&path);
 
         match std::fs::File::open(&backend_path) {
             Ok(file) => {
@@ -674,7 +687,7 @@ impl Filesystem for RarGateFs {
                     Some(path) => path.clone(),
                     None => { reply.error(libc::ENOENT); return; }
                 };
-                let backend_path = self.backend_path(&path.to_string_lossy());
+                let backend_path = self.backend_path_for(&path);
                 match std::fs::File::open(&backend_path) {
                     Ok(mut f) => {
                         if f.seek(SeekFrom::Start(offset as u64)).is_err() {
@@ -754,7 +767,7 @@ impl Filesystem for RarGateFs {
             }
         };
 
-        let backend_path = self.backend_path(&path.to_string_lossy());
+        let backend_path = self.backend_path_for(&path);
 
         match std::fs::read_link(&backend_path) {
             Ok(target) => {
@@ -775,7 +788,7 @@ impl Filesystem for RarGateFs {
             }
         };
 
-        let backend_path = self.backend_path(&path.to_string_lossy());
+        let backend_path = self.backend_path_for(&path);
 
         match nix::sys::statvfs::statvfs(&backend_path) {
             Ok(stat) => {
@@ -819,7 +832,7 @@ impl Filesystem for RarGateFs {
         // Only actual RAR-extracted content is protected (checked in setattr/write)
 
         // Write to source path (not backend which is read-only rar2fs)
-        let source_path = self.source_path(&dir_path.to_string_lossy());
+        let source_path = self.source_path_for(&dir_path);
 
         match std::fs::create_dir(&source_path) {
             Ok(_) => {
@@ -871,7 +884,7 @@ impl Filesystem for RarGateFs {
         // This allows users to add subtitles, NFO files, etc.
         // Only actual RAR-extracted content is protected (checked in setattr/write)
 
-        let source_path = self.source_path(&file_path.to_string_lossy());
+        let source_path = self.source_path_for(&file_path);
 
         // Create empty file
         match std::fs::File::create(&source_path) {
@@ -924,7 +937,7 @@ impl Filesystem for RarGateFs {
         // This allows users to add subtitles, NFO files, etc.
         // Only actual RAR-extracted content is protected (checked in setattr/write)
 
-        let source_path = self.source_path(&file_path.to_string_lossy());
+        let source_path = self.source_path_for(&file_path);
 
         // Create empty file
         match std::fs::File::create(&source_path) {
@@ -978,7 +991,7 @@ impl Filesystem for RarGateFs {
             return;
         }
 
-        let source_path = self.source_path(&path.to_string_lossy());
+        let source_path = self.source_path_for(&path);
 
         match std::fs::OpenOptions::new().write(true).open(&source_path) {
             Ok(mut file) => {
@@ -1025,7 +1038,7 @@ impl Filesystem for RarGateFs {
             return;
         }
 
-        let source_path = self.source_path(&path.to_string_lossy());
+        let source_path = self.source_path_for(&path);
 
         // Apply mode
         #[cfg(unix)]
@@ -1144,8 +1157,8 @@ impl Filesystem for RarGateFs {
         // Only the source file matters for RAR protection.
         // New files (including renamed destinations) are always writable.
 
-        let old_source = self.source_path(&old_path.to_string_lossy());
-        let new_source = self.source_path(&new_path.to_string_lossy());
+        let old_source = self.source_path_for(&old_path);
+        let new_source = self.source_path_for(&new_path);
 
         match std::fs::rename(&old_source, &new_source) {
             Ok(_) => {
