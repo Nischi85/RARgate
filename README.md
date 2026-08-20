@@ -184,6 +184,12 @@ sfv_validation:
   validation_backoff:
     max_failures: 3
     cooldown_seconds: 300    # Back off after repeated failures
+    escalate_after: 25       # Loud ERROR + status-file flag after N failures (likely
+                              # incomplete/abandoned download)
+    regression_escalate_after: 3  # Same, but for a dir that was ALREADY valid and
+                              # just started failing (files deleted/moved out from
+                              # under it) — escalates immediately instead of waiting
+                              # through many cooldown cycles like a fresh download does
 ```
 
 **File Filtering:**
