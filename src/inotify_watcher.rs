@@ -96,6 +96,13 @@ const DEFAULT_MAX_VALIDATION_FAILURES: u32 = 3;
 /// incomplete or abandoned download rather than a still-in-progress one.
 const DEFAULT_SFV_ESCALATION_THRESHOLD: u32 = 25;
 
+/// Default consecutive failures before escalating a REGRESSION — a directory that was
+/// already a confirmed, announced media dir and has now started failing validation
+/// (files deleted/moved out from under it, not a normal still-downloading release).
+/// Escalates as soon as it enters cooldown at all, rather than waiting through many
+/// cooldown cycles like a fresh/never-seen directory does.
+const DEFAULT_REGRESSION_ESCALATION_THRESHOLD: u32 = 3;
+
 /// Failure counts at which a throttled WARN is logged. Without this, a permanently
 /// broken release re-WARNs every cooldown cycle (hundreds of identical lines); we
 /// instead log only when crossing one of these milestones.
@@ -198,6 +205,9 @@ pub struct InotifyWatcher {
     validation_cooldown_secs: u64,
     /// Consecutive failures after which a release is escalated (loud ERROR + status flag)
     escalation_threshold: u32,
+    /// Same as escalation_threshold, but for a directory that regressed from an
+    /// already-confirmed media dir (see DEFAULT_REGRESSION_ESCALATION_THRESHOLD).
+    regression_escalation_threshold: u32,
     /// Debounce time in seconds for SFV validation
     sfv_debounce_secs: u64,
     /// Time in seconds after which notified entries are cleaned up
@@ -229,6 +239,7 @@ struct WatchLoopContext {
     max_validation_failures: u32,
     validation_cooldown_secs: u64,
     escalation_threshold: u32,
+    regression_escalation_threshold: u32,
     sfv_debounce_secs: u64,
     pending_cleanup_secs: u64,
     revalidation_threshold_secs: u64,
@@ -261,6 +272,10 @@ impl InotifyWatcher {
         let escalation_threshold = validation_backoff
             .and_then(|b| b.escalate_after)
             .unwrap_or(DEFAULT_SFV_ESCALATION_THRESHOLD)
+            .max(max_validation_failures);
+        let regression_escalation_threshold = validation_backoff
+            .and_then(|b| b.regression_escalate_after)
+            .unwrap_or(DEFAULT_REGRESSION_ESCALATION_THRESHOLD)
             .max(max_validation_failures);
 
         // Get watcher timing config with defaults
@@ -296,6 +311,7 @@ impl InotifyWatcher {
             max_validation_failures,
             validation_cooldown_secs,
             escalation_threshold,
+            regression_escalation_threshold,
             sfv_debounce_secs,
             pending_cleanup_secs,
             revalidation_threshold_secs,
@@ -376,6 +392,8 @@ impl InotifyWatcher {
               self.max_validation_failures, self.validation_cooldown_secs);
         info!("  SFV escalation: loud ERROR + status flag after {} failures",
               self.escalation_threshold);
+        info!("  SFV regression escalation: loud ERROR + status flag after {} failures \
+               for a previously-confirmed media dir", self.regression_escalation_threshold);
 
         let ctx = WatchLoopContext {
             verified_path: self.verified_path.clone(),
@@ -386,6 +404,7 @@ impl InotifyWatcher {
             max_validation_failures: self.max_validation_failures,
             validation_cooldown_secs: self.validation_cooldown_secs,
             escalation_threshold: self.escalation_threshold,
+            regression_escalation_threshold: self.regression_escalation_threshold,
             sfv_debounce_secs: self.sfv_debounce_secs,
             pending_cleanup_secs: self.pending_cleanup_secs,
             revalidation_threshold_secs: self.revalidation_threshold_secs,
@@ -442,6 +461,7 @@ impl InotifyWatcher {
         let max_validation_failures = ctx.max_validation_failures;
         let validation_cooldown_secs = ctx.validation_cooldown_secs;
         let escalation_threshold = ctx.escalation_threshold;
+        let regression_escalation_threshold = ctx.regression_escalation_threshold;
         let sfv_debounce_secs = ctx.sfv_debounce_secs;
         let pending_cleanup_secs = ctx.pending_cleanup_secs;
         let revalidation_threshold_secs = ctx.revalidation_threshold_secs;
@@ -655,11 +675,25 @@ impl InotifyWatcher {
                                 .map(|f| (f.last_milestone_logged, f.escalated))
                                 .unwrap_or((0, false));
 
-                            if failure_count >= escalation_threshold && !already_escalated {
+                            // A directory already in announced_dirs passed validation once —
+                            // now failing means its files were very likely deleted/moved out
+                            // from under it (not a normal still-downloading release), so it
+                            // escalates on a much shorter fuse. peek() to avoid bumping LRU
+                            // recency for what's just a status check.
+                            let is_regression = announced_dirs.peek(&dir_path).is_some();
+                            let effective_escalation_threshold =
+                                if is_regression { regression_escalation_threshold } else { escalation_threshold };
+
+                            if failure_count >= effective_escalation_threshold && !already_escalated {
                                 // One loud, distinct line — easy to spot in the log — then go
                                 // quiet (the status file carries it from here).
-                                error!("🛑 PERSISTENT SFV FAILURE: {} — failed {} times over {}; likely an incomplete or abandoned download. Re-grab or remove it.",
-                                       dir_path.display(), failure_count, stuck_for);
+                                if is_regression {
+                                    error!("🛑 REGRESSED MEDIA DIR: {} — was previously valid, now failing SFV validation {} times over {}; files were very likely deleted or moved. Re-grab or remove it.",
+                                           dir_path.display(), failure_count, stuck_for);
+                                } else {
+                                    error!("🛑 PERSISTENT SFV FAILURE: {} — failed {} times over {}; likely an incomplete or abandoned download. Re-grab or remove it.",
+                                           dir_path.display(), failure_count, stuck_for);
+                                }
                                 if let Some(f) = failed_validations.get_mut(&dir_path) {
                                     f.escalated = true;
                                     f.last_milestone_logged = failure_count;

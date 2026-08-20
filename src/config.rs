@@ -85,6 +85,12 @@ pub struct ValidationBackoffConfig {
     /// Consecutive failures after which a single loud ERROR is logged and the release
     /// is flagged as stuck in the status file (likely incomplete/abandoned). Default: 25
     pub escalate_after: Option<u32>,
+    /// Same as escalate_after, but for a directory that was PREVIOUSLY a confirmed,
+    /// announced media dir (i.e. it passed validation once already) and has now started
+    /// failing — strong evidence its files were deleted/moved out from under it, not a
+    /// normal still-downloading release. Escalates much sooner. Default: 3 (i.e. as soon
+    /// as it enters cooldown at all, rather than waiting through many cooldown cycles).
+    pub regression_escalate_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
