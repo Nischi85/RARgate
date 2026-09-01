@@ -37,6 +37,38 @@ pub fn is_sfv_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Case-insensitive basename -> (real filename, parent dir) index, built once
+/// per validation pass from the SAME two-level scan filtering.rs's own
+/// case-insensitive SFV matching already uses (top-level entries, plus one
+/// level into subfolders for scene Sample\ layouts) — kept as a sibling
+/// function here rather than sharing filtering.rs's HashMap<String, String>
+/// shape, since this one also needs to remember WHERE each file actually
+/// lives to build a real, stat-able path for the completeness check below.
+fn index_actual_files(dir_path: &Path) -> HashMap<String, (String, std::path::PathBuf)> {
+    let mut index = HashMap::new();
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(e) => e,
+        Err(_) => return index,
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_file() {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            index.insert(filename.to_lowercase(), (filename, dir_path.to_path_buf()));
+        } else if entry_path.is_dir() {
+            if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                for sub in sub_entries.flatten() {
+                    if sub.path().is_file() {
+                        let sub_name = sub.file_name().to_string_lossy().to_string();
+                        index.entry(sub_name.to_lowercase()).or_insert((sub_name, entry_path.clone()));
+                    }
+                }
+            }
+        }
+    }
+    index
+}
+
 /// Validate SFV file with completeness checking - check if all listed files exist AND are complete
 /// Returns true if all files listed in the SFV exist and are no longer being written.
 /// This is the function used by inotify_watcher for detecting when downloads are truly complete.
@@ -62,6 +94,16 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
         }
     };
 
+    // Built once, matched case-insensitively below — an SFV's own listed
+    // filenames are frequently lowercased regardless of the actual release's
+    // case (a normal scene convention), so a plain case-sensitive exists()
+    // check can report a fully-downloaded release as permanently missing
+    // files it actually has. filtering.rs's own SFV check already handles
+    // this the same way; this function didn't, which is what let a real,
+    // complete download sit stuck re-failing validation forever instead of
+    // ever notifying Sonarr/Radarr/Emby.
+    let actual_files = index_actual_files(dir_path);
+
     // Check each file listed in SFV for existence AND completeness
     for line in content.lines() {
         // Strip a leading UTF-8 BOM (PowerShell-generated SFVs are UTF-8-with-BOM,
@@ -77,16 +119,18 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
             let filename = line[..space_pos].trim();
             if !filename.is_empty() {
                 // SFV entries may reference a subfolder with a Windows separator
-                // (e.g. 'Sample\foo-sample.mkv'); normalise to '/' so the path
-                // resolves on Unix.
-                let rel = filename.replace('\\', "/");
-                let file_path = dir_path.join(&rel);
+                // (e.g. 'Sample\foo-sample.mkv'); the index above already
+                // flattens subfolder files by basename, so match on that.
+                let base = filename.replace('\\', "/");
+                let base = base.rsplit('/').next().unwrap_or(&base);
 
-                // Check if file exists
-                if !file_path.exists() {
-                    debug!("SFV validation failed: missing file {}", filename);
-                    return false;
-                }
+                let file_path = match actual_files.get(&base.to_lowercase()) {
+                    Some((real_name, parent)) => parent.join(real_name),
+                    None => {
+                        debug!("SFV validation failed: missing file {}", filename);
+                        return false;
+                    }
+                };
 
                 // Check if file is complete (not actively being written)
                 if !is_file_complete(&file_path) {
@@ -98,6 +142,63 @@ pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::thread::sleep;
+    use tempfile::tempdir;
+
+    fn write_old(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        // is_file_complete requires FILE_COMPLETE_AGE_SECS (1s) of age.
+        sleep(Duration::from_millis(1100));
+    }
+
+    #[test]
+    fn validates_when_sfv_lists_lowercase_but_real_files_are_mixed_case() {
+        let dir = tempdir().unwrap();
+        write_old(&dir.path().join("Release.Name.r00"), b"x");
+        write_old(&dir.path().join("Release.Name.r01"), b"x");
+        let sfv_path = dir.path().join("release.name.sfv");
+        fs::write(&sfv_path, "release.name.r00 DEADBEEF\nrelease.name.r01 CAFEBABE\n").unwrap();
+
+        assert!(validate_sfv_with_completeness(&sfv_path));
+    }
+
+    #[test]
+    fn fails_when_a_listed_file_is_genuinely_missing() {
+        let dir = tempdir().unwrap();
+        write_old(&dir.path().join("Release.Name.r00"), b"x");
+        let sfv_path = dir.path().join("release.name.sfv");
+        fs::write(&sfv_path, "release.name.r00 DEADBEEF\nrelease.name.r01 CAFEBABE\n").unwrap();
+
+        assert!(!validate_sfv_with_completeness(&sfv_path));
+    }
+
+    #[test]
+    fn defers_when_a_matched_file_was_just_written() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Release.Name.r00"), b"x").unwrap(); // fresh, no sleep
+        let sfv_path = dir.path().join("release.name.sfv");
+        fs::write(&sfv_path, "release.name.r00 DEADBEEF\n").unwrap();
+
+        assert!(!validate_sfv_with_completeness(&sfv_path));
+    }
+
+    #[test]
+    fn resolves_a_case_mismatched_sample_subfolder_entry() {
+        let dir = tempdir().unwrap();
+        let sample_dir = dir.path().join("Sample");
+        fs::create_dir(&sample_dir).unwrap();
+        write_old(&sample_dir.join("Release.Name-sample.mkv"), b"x");
+        let sfv_path = dir.path().join("release.name.sfv");
+        fs::write(&sfv_path, "sample\\release.name-sample.mkv DEADBEEF\n").unwrap();
+
+        assert!(validate_sfv_with_completeness(&sfv_path));
+    }
 }
 
 /// Validate SFV content against a HashMap (used by filtering.rs)
