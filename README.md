@@ -197,6 +197,9 @@ sfv_validation:
 filters:
   exclude_dirs: [sample, proof, subs]
   exclude_files: ["*.nfo", "*.sfv", "*.exe"]
+  include_dirs: [Movies, "TV Shows"]   # Optional whitelist: only these top-level
+                                       # dirs are shown at the mount root, everything
+                                       # else there is hidden. Absent/empty = no restriction
   rar_archives:
     enabled: true
     hide_archives: true      # Hide .rar/.r00, show extracted content

@@ -40,6 +40,8 @@ filters:
   # File patterns to hide (wildcards supported)
   exclude_files: ["*.sfv", "*.nfo", "*.exe", "*.log", "*.txt", "*.dctmp", "*.part", "*.tmp", "*.!qB", "*.m3u", "*.meta", "*.verified", "*.embyignore"]
 
+  # include_dirs: [Movies, "TV Shows"]   # Optional: only these top-level dirs shown at mount root, rest hidden (omit = no restriction)
+
   # Valid media extensions (for RAR extraction and Emby notifications)
   media_extensions: [mkv, mp4, avi, m4v, mov, wmv, flv, mpg, mpeg, mp3, flac, m4a, wav, aac, ogg, wma, iso, img, bin, cue]
 
@@ -62,8 +64,10 @@ sfv_validation:
   unverified_share_indicators: ["/unverified/"]  # Path fragments that identify the "unverified/in-progress" share
   # Backoff for failed validations (prevents log spam)
   validation_backoff:
-    max_failures: 3       # Enter cooldown after N failures
-    cooldown_seconds: 300 # Wait 5 min before retrying
+    max_failures: 3               # Enter cooldown after N failures
+    cooldown_seconds: 300         # Wait 5 min before retrying
+    escalate_after: 25            # After N failures: loud ERROR + flag in status file (likely incomplete/abandoned download)
+    regression_escalate_after: 3  # Same, but for a dir that passed once and started failing (files removed under it) — escalates sooner
   # Download detection threshold (seconds)
   # Files modified within this time are "in progress" - SFV failures won't be logged
   download_threshold_seconds: 60
