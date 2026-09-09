@@ -614,21 +614,21 @@ impl InotifyWatcher {
                         // the servers, but is rate-limited so the burst of events from a single
                         // subtitle add/sync collapses into one line instead of spamming.
                         let last_announce = announced_dirs.get(&dir_path).copied();
-                        let should_notify = match last_announce {
+                        let (should_notify, is_first_announce) = match last_announce {
                             None => {
                                 info!("SFV validation passed for {} (took {:.1}ms)",
                                       dir_path.display(), validation_duration.as_secs_f64() * 1000.0);
                                 info!("New media dir: {}", dir_path.display());
-                                true
+                                (true, true)
                             }
                             Some(t) if now.duration_since(t) >= std::time::Duration::from_secs(RE_NOTIFY_MIN_INTERVAL_SECS) => {
-                                info!("Media dir changed, re-notifying servers: {}", dir_path.display());
-                                true
+                                info!("Media dir changed, re-notifying media servers: {}", dir_path.display());
+                                (true, false)
                             }
                             Some(_) => {
                                 // Within the rate-limit window — same operation's churn, skip.
                                 debug!("Skipping duplicate re-notification (recent) for {}", dir_path.display());
-                                false
+                                (false, false)
                             }
                         };
 
@@ -637,10 +637,17 @@ impl InotifyWatcher {
                             Self::notify_server(&emby_tx, &dir_path, false, "Emby");
                             Self::notify_server(&jellyfin_tx, &dir_path, false, "Jellyfin");
                             Self::notify_server(&plex_tx, &dir_path, false, "Plex");
-                            // SFV passed → the release is now visible in the mount. This is the
-                            // authoritative moment to import: fire an in-place Sonarr/Radarr
-                            // rescan so the grab lands without depending on dc-bridge's nudge.
-                            Self::notify_server(&arr_tx, &dir_path, false, "Arr");
+                            // Sonarr/Radarr get a rescan ONLY on the first announce — that's the
+                            // authoritative "the release is now visible, import it in place"
+                            // moment. A later change to an already-imported release (a subtitle
+                            // or metadata sidecar landing, courtesy of bazarr et al.) has no
+                            // *arr relevance: they don't manage external subs, and the rescan
+                            // races the overlay-cache refresh — Sonarr's scan can briefly not
+                            // see the media file and mark it MissingFromDisk. Media servers
+                            // still get poked so external subs show up promptly.
+                            if is_first_announce {
+                                Self::notify_server(&arr_tx, &dir_path, false, "Arr");
+                            }
                         }
 
                         // Mark as notified with timestamp for cleanup/re-validation
