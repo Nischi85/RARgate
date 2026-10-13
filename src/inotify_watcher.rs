@@ -177,6 +177,29 @@ fn is_temporary_path(path: &Path) -> bool {
     false
 }
 
+/// How recently a partial-download file (`.dctmp`, `.part`, `.!qB`, ...) must have
+/// been written for its release to count as still downloading. A long multi-volume
+/// grab can leave one volume idle for hours while another is being written, so this
+/// keys off the NEWEST partial file in the directory. Past it, the download has
+/// genuinely stalled and the release is reported as stuck like any other.
+const ACTIVE_DOWNLOAD_GRACE_SECS: u64 = 6 * 3600;
+
+/// True if `dir` holds a partial-download file written within `grace` — i.e. the
+/// release is still being downloaded, so failing SFV validation is expected (most
+/// volumes simply aren't there yet) and must not be reported as stuck.
+fn has_active_download(dir: &Path, grace: std::time::Duration) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.flatten().any(|entry| {
+        is_temporary_path(&entry.path())
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < grace)
+    })
+}
+
 /// Check if a directory matches an exclude pattern (case-insensitive)
 fn is_excluded_dir(exclude_dirs: &[String], path: &Path) -> bool {
     if let Some(name) = path.file_name() {
@@ -674,7 +697,17 @@ impl InotifyWatcher {
                                 (1, now_wall)
                             };
 
-                        if failure_count >= max_validation_failures {
+                        let downloading = failure_count >= max_validation_failures
+                            && has_active_download(&dir_path, std::time::Duration::from_secs(ACTIVE_DOWNLOAD_GRACE_SECS));
+
+                        if downloading {
+                            // Still being downloaded — missing volumes are expected, not a
+                            // stuck release. Backoff/cooldown above still applies; only the
+                            // WARN/ERROR escalation and the status-file flag are skipped.
+                            debug!("SFV validation failing for {} ({} times) but a download is still in progress, not flagging as stuck",
+                                   dir_path.display(), failure_count);
+                            if let Some(m) = metrics { m.clear_stuck(&dir_path); }
+                        } else if failure_count >= max_validation_failures {
                             let stuck_for = humanize_duration(first_seen.elapsed().unwrap_or_default());
                             // Read prior throttle state without bumping LRU recency.
                             let (prev_milestone, already_escalated) = failed_validations
@@ -1315,5 +1348,56 @@ impl InotifyWatcher {
         debug!("Sending {} notification (is_deletion={}) for: {}", server_name, is_deletion, event.path().display());
         let handle = handle.clone();
         tokio::spawn(async move { handle.notify(event).await; });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn touch(path: &Path, age: Duration) {
+        let f = std::fs::File::create(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    const GRACE: Duration = Duration::from_secs(ACTIVE_DOWNLOAD_GRACE_SECS);
+
+    #[test]
+    fn active_download_recent_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("rel.rar"), Duration::from_secs(10 * 3600));
+        touch(&dir.path().join("rel.r00.dctmp"), Duration::from_secs(60));
+        assert!(has_active_download(dir.path(), GRACE));
+    }
+
+    #[test]
+    fn active_download_newest_partial_wins() {
+        // One volume idle for hours while another is being written — still downloading.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("rel.r01.dctmp"), Duration::from_secs(11 * 3600));
+        touch(&dir.path().join("rel.r00.dctmp"), Duration::from_secs(30));
+        assert!(has_active_download(dir.path(), GRACE));
+    }
+
+    #[test]
+    fn stalled_download_is_not_active() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("rel.r00.dctmp"), Duration::from_secs(7 * 3600));
+        assert!(!has_active_download(dir.path(), GRACE));
+    }
+
+    #[test]
+    fn no_partial_files_is_not_active() {
+        // Missing volumes with nothing downloading: genuinely incomplete/deleted.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("rel.rar"), Duration::from_secs(5));
+        touch(&dir.path().join("rel.sfv"), Duration::from_secs(5));
+        assert!(!has_active_download(dir.path(), GRACE));
+    }
+
+    #[test]
+    fn missing_dir_is_not_active() {
+        assert!(!has_active_download(Path::new("/nonexistent/rargate-test"), GRACE));
     }
 }
