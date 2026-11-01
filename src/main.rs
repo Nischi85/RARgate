@@ -522,3 +522,19 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Cargo.toml's version must match the newest CHANGELOG.md release heading,
+    /// so a release tag, its binary and the status file all report the same version.
+    #[test]
+    fn cargo_version_matches_changelog() {
+        let changelog = include_str!("../CHANGELOG.md");
+        let newest = changelog
+            .lines()
+            .find_map(|l| l.strip_prefix("## v"))
+            .and_then(|l| l.split_whitespace().next())
+            .expect("CHANGELOG.md has no '## vX.Y.Z' heading");
+        assert_eq!(newest, super::VERSION, "bump Cargo.toml to the newest CHANGELOG.md version");
+    }
+}

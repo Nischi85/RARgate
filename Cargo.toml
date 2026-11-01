@@ -1,6 +1,6 @@
 [package]
 name = "rargate"
-version = "1.0.0"
+version = "1.4.0"
 edition = "2021"
 authors = ["RARGate Team"]
 description = "High-performance FUSE filesystem with RAR archive support, intelligent filtering, and multi-server media integration"
