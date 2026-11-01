@@ -19,6 +19,7 @@ use tracing::{info, error, warn};
 
 use crate::config::Rar2fsConfig;
 use crate::metrics::MetricsCollector;
+use crate::utils::mount_listed;
 
 /// Counting semaphore that caps concurrent rar2fs backend `read_dir` calls.
 ///
@@ -93,8 +94,6 @@ pub const RAR2FS_LOG_PATH: &str = "/mnt/cache/rargate/rar2fs.log";
 pub struct Rar2fsBackend {
     backend_path: PathBuf,
     process: Option<Child>,
-    /// PID of rar2fs process (if started by us)
-    rar2fs_pid: Option<u32>,
 }
 
 impl Rar2fsBackend {
@@ -113,17 +112,14 @@ impl Rar2fsBackend {
         std::fs::create_dir_all(&backend_path)?;
 
         // Check if already mounted
-        if is_mounted(&backend_path) {
+        if mount_listed(&backend_path) {
             info!("Backend already mounted at: {:?}", backend_path);
-            // Try to find existing rar2fs PID
-            let existing_pid = find_rar2fs_pid(&backend_path);
-            if let Some(pid) = existing_pid {
+            if let Some(pid) = find_rar2fs_pid(&backend_path) {
                 info!("Found existing rar2fs process with PID: {}", pid);
             }
             return Ok(Self {
                 backend_path,
                 process: None,
-                rar2fs_pid: existing_pid,
             });
         }
 
@@ -180,12 +176,12 @@ impl Rar2fsBackend {
 
         // Wait for mount to be ready (rar2fs typically mounts in ~200ms)
         let mut attempts = 0;
-        while !is_mounted(&backend_path) && attempts < 50 {
+        while !mount_listed(&backend_path) && attempts < 50 {
             thread::sleep(Duration::from_millis(100));
             attempts += 1;
         }
 
-        if !is_mounted(&backend_path) {
+        if !mount_listed(&backend_path) {
             error!("rar2fs failed to mount after 5 seconds - check logs and ensure backend directory is clean");
             return Err(anyhow::anyhow!("rar2fs mount timeout - backend directory may not be empty or rar2fs failed"));
         }
@@ -202,18 +198,12 @@ impl Rar2fsBackend {
         Ok(Self {
             backend_path,
             process: Some(process),
-            rar2fs_pid: Some(actual_pid),
         })
     }
 
     /// Get backend mount path
     pub fn path(&self) -> &Path {
         &self.backend_path
-    }
-
-    /// Get rar2fs process ID (if known)
-    pub fn pid(&self) -> Option<u32> {
-        self.rar2fs_pid
     }
 
     /// Stop rar2fs backend
@@ -225,7 +215,7 @@ impl Rar2fsBackend {
         }
 
         // Unmount if still mounted
-        if is_mounted(&self.backend_path) {
+        if mount_listed(&self.backend_path) {
             let _ = Command::new("fusermount3")
                 .arg("-u")
                 .arg(&self.backend_path)
@@ -240,23 +230,8 @@ impl Drop for Rar2fsBackend {
     }
 }
 
-/// Check if a path is a mount point
-fn is_mounted(path: &Path) -> bool {
-    // Try to read /proc/mounts
-    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
-        let path_str = path.to_string_lossy();
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == path_str.as_ref() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Find rar2fs process ID by looking for the process that has the mount point
-fn find_rar2fs_pid(backend_path: &Path) -> Option<u32> {
+/// Find the rar2fs process serving `backend_path` (its mount point is on the command line).
+pub fn find_rar2fs_pid(backend_path: &Path) -> Option<u32> {
     // Search through /proc for rar2fs processes
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,

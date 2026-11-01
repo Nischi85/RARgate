@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
     // Start rar2fs resource monitoring (for debugging crashes), unless disabled.
     let _rar2fs_monitor = if rar2fs_resources_enabled {
         Some(monitoring::start_rar2fs_resource_monitor(
-            backend.pid(),
+            backend.path().to_path_buf(),
             rar2fs_resources_log_path.clone(),
             rar2fs_resource_interval,
         ))

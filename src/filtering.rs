@@ -23,7 +23,7 @@ use crate::backend::RarFsLimiter;
 use crate::config::{Config, SfvConfig, FiltersConfig, OverlayConfig, UnionfsConfig};
 use crate::media_notifier_common::DEFAULT_MEDIA_EXTENSIONS;
 use crate::metrics::MetricsCollector;
-use crate::sfv::validate_sfv_content_with_map;
+use crate::sfv::{all_listed_files_present, read_sfv, ReleaseFiles};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SfvMode {
@@ -617,8 +617,8 @@ impl FilterEngine {
 
         // Now read SOURCE layer (verified/unverified) for SFV validation - this has the actual RAR files
         // Only done for directories with media files (need SFV validation)
-        let entries = match std::fs::read_dir(&source_path) {
-            Ok(entries) => entries,
+        let release_files = match ReleaseFiles::read(&source_path) {
+            Ok(files) => files,
             Err(e) => {
                 warn!("Failed to read directory {}: {}", backend_dir_path.display(), e);
                 let info = DirectoryInfo {
@@ -629,40 +629,8 @@ impl FilterEngine {
                 return info;
             }
         };
-
-        // Build file list from SOURCE layer for SFV validation
-        let mut has_sfv = false;
-        let mut sfv_file_path = None;
-        let mut actual_files = std::collections::HashMap::new(); // Build once for SFV validation
-
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_file() {
-                let filename = entry.file_name().to_string_lossy().to_string();
-                let lower_name = filename.to_lowercase();
-
-                // Build case-insensitive filename map for SFV validation (RAR parts, etc.)
-                actual_files.insert(lower_name.clone(), filename);
-
-                if lower_name.ends_with(".sfv") {
-                    has_sfv = true;
-                    sfv_file_path = Some(entry_path);
-                    debug!("SFV file found in {}: {}", source_path.display(), lower_name);
-                }
-            } else if entry_path.is_dir() {
-                // Scene releases place samples/proofs in a subfolder that the
-                // SFV references with a Windows path (e.g. 'Sample\foo.mkv').
-                // Index those files by basename so such SFV entries validate.
-                if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
-                    for sub in sub_entries.flatten() {
-                        if sub.path().is_file() {
-                            let sub_name = sub.file_name().to_string_lossy().to_string();
-                            actual_files.entry(sub_name.to_lowercase()).or_insert(sub_name);
-                        }
-                    }
-                }
-            }
-        }
+        let has_sfv = release_files.sfv.is_some();
+        let sfv_file_path = release_files.sfv.clone();
 
         // Determine if should show (only for directories with media files)
         let should_show = {
@@ -691,7 +659,7 @@ impl FilterEngine {
                     if !has_sfv {
                         true
                     } else if let Some(ref sfv_path) = sfv_file_path {
-                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &actual_files);
+                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &release_files);
                         if !sfv_valid {
                             debug!("Hiding directory {} (permissive mode, SFV present but validation failed)", backend_dir_path.display());
                             self.log_sfv_failure(backend_dir_path, "permissive mode, SFV validation failed", true, has_sfv);
@@ -710,7 +678,7 @@ impl FilterEngine {
                         false
                     } else if let Some(ref sfv_path) = sfv_file_path {
                         // Validate SFV contents in strict mode using pre-built file list (PERFORMANCE FIX)
-                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &actual_files);
+                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &release_files);
                         if !sfv_valid {
                             debug!("Hiding directory {} (strict mode, SFV validation failed)", backend_dir_path.display());
                             self.log_sfv_failure(backend_dir_path, "strict mode, SFV validation failed", true, has_sfv);
@@ -753,14 +721,11 @@ impl FilterEngine {
     }
 
     /// Validate SFV file contents - check if all listed files exist
-    /// PERFORMANCE: Accepts pre-built file list to avoid double directory read (50% I/O reduction)
-    fn validate_sfv_file_with_files(&self, sfv_file_path: &Path, actual_files: &std::collections::HashMap<String, String>) -> bool {
-        // Validate SFV entries against pre-built file list using shared module
-        // Use lossy UTF-8 to handle legacy encodings (ISO-8859-1, Windows-1252)
-        match std::fs::read(sfv_file_path) {
-            Ok(bytes) => {
-                let content = String::from_utf8_lossy(&bytes);
-                let valid = validate_sfv_content_with_map(&content, actual_files);
+    /// PERFORMANCE: Accepts the already-read release files to avoid a second directory read
+    fn validate_sfv_file_with_files(&self, sfv_file_path: &Path, release_files: &ReleaseFiles) -> bool {
+        match read_sfv(sfv_file_path) {
+            Ok(content) => {
+                let valid = all_listed_files_present(&content, release_files);
                 if valid {
                     debug!("SFV validation passed for {}", sfv_file_path.display());
                 } else {

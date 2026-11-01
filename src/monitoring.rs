@@ -189,14 +189,11 @@ pub async fn start_monitor(
     Ok(handle)
 }
 
-async fn is_mounted(path: &PathBuf) -> Result<bool> {
-    let output = tokio::process::Command::new("mountpoint")
-        .arg("-q")
-        .arg(path)
-        .output()
-        .await?;
-
-    Ok(output.status.success())
+/// `utils::mountpoint_responds` off the async runtime: stat on a hung FUSE
+/// mount can block indefinitely, which must not stall a runtime worker.
+async fn is_mounted(path: &Path) -> Result<bool> {
+    let path = path.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || crate::utils::mountpoint_responds(&path)).await?)
 }
 
 /// Send Unraid notification using the built-in notify script. Silently
@@ -244,7 +241,7 @@ async fn send_unraid_notification(subject: &str, description: &str) {
 /// Start rar2fs resource monitoring task.
 /// Logs FD count, memory usage, and I/O stats to `log_path` every `interval_secs` seconds.
 pub fn start_rar2fs_resource_monitor(
-    rar2fs_pid: Option<u32>,
+    backend_path: PathBuf,
     log_path: PathBuf,
     interval_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -257,19 +254,12 @@ pub fn start_rar2fs_resource_monitor(
         info!("rar2fs resource monitoring started (logging every {}s to {})", interval_secs, log_path.display());
 
         loop {
-            let pid = match rar2fs_pid {
-                Some(p) => p,
-                None => {
-                    // Try to find rar2fs PID dynamically
-                    match find_rar2fs_pid_dynamic().await {
-                        Some(p) => p,
-                        None => {
-                            warn!("rar2fs resource monitor: cannot find rar2fs process");
-                            sleep(interval).await;
-                            continue;
-                        }
-                    }
-                }
+            // Looked up each pass: rar2fs can be restarted under a new PID, and
+            // another rargate instance may run its own rar2fs on a different mount.
+            let Some(pid) = crate::backend::find_rar2fs_pid(&backend_path) else {
+                warn!("rar2fs resource monitor: cannot find rar2fs process for {}", backend_path.display());
+                sleep(interval).await;
+                continue;
             };
 
             // Collect resource stats
@@ -294,22 +284,6 @@ struct Rar2fsStats {
     read_bytes: u64,
     write_bytes: u64,
     state: String,
-}
-
-async fn find_rar2fs_pid_dynamic() -> Option<u32> {
-    let output = tokio::process::Command::new("pgrep")
-        .arg("-x")
-        .arg("rar2fs")
-        .output()
-        .await
-        .ok()?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.trim().lines().next()?.parse().ok()
-    } else {
-        None
-    }
 }
 
 async fn collect_rar2fs_stats(pid: u32) -> Option<Rar2fsStats> {

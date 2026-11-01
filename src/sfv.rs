@@ -5,7 +5,7 @@
 //! - inotify_watcher.rs (for detecting when downloads are complete)
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -37,110 +37,111 @@ pub fn is_sfv_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Case-insensitive basename -> (real filename, parent dir) index, built once
-/// per validation pass from the SAME two-level scan filtering.rs's own
-/// case-insensitive SFV matching already uses (top-level entries, plus one
-/// level into subfolders for scene Sample\ layouts) — kept as a sibling
-/// function here rather than sharing filtering.rs's HashMap<String, String>
-/// shape, since this one also needs to remember WHERE each file actually
-/// lives to build a real, stat-able path for the completeness check below.
-fn index_actual_files(dir_path: &Path) -> HashMap<String, (String, std::path::PathBuf)> {
-    let mut index = HashMap::new();
-    let entries = match std::fs::read_dir(dir_path) {
-        Ok(e) => e,
-        Err(_) => return index,
-    };
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
-        if entry_path.is_file() {
-            let filename = entry.file_name().to_string_lossy().to_string();
-            index.insert(filename.to_lowercase(), (filename, dir_path.to_path_buf()));
-        } else if entry_path.is_dir() {
-            if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
-                for sub in sub_entries.flatten() {
-                    if sub.path().is_file() {
-                        let sub_name = sub.file_name().to_string_lossy().to_string();
-                        index.entry(sub_name.to_lowercase()).or_insert((sub_name, entry_path.clone()));
+/// The files of one release directory, for matching SFV entries against.
+///
+/// Matching is case-insensitive and by basename: an SFV's listed names are
+/// frequently lowercased regardless of the real files' case (a normal scene
+/// convention), and scene releases put samples in a subfolder the SFV
+/// references with a Windows path (`Sample\foo.mkv`). So top-level files and
+/// the files one level down are indexed together by lowercase basename; a
+/// top-level file wins over a subfolder file with the same name.
+pub struct ReleaseFiles {
+    /// lowercase basename -> (real filename, directory it lives in)
+    by_name: HashMap<String, (String, PathBuf)>,
+    /// The release's own `.sfv` (a top-level one; the last one read if several).
+    pub sfv: Option<PathBuf>,
+}
+
+impl ReleaseFiles {
+    pub fn read(dir_path: &Path) -> std::io::Result<Self> {
+        let mut by_name = HashMap::new();
+        let mut sfv = None;
+        for entry in std::fs::read_dir(dir_path)?.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                if is_sfv_file(&entry_path) {
+                    sfv = Some(entry_path);
+                }
+                by_name.insert(filename.to_lowercase(), (filename, dir_path.to_path_buf()));
+            } else if entry_path.is_dir() {
+                if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                    for sub in sub_entries.flatten() {
+                        if sub.path().is_file() {
+                            let sub_name = sub.file_name().to_string_lossy().to_string();
+                            by_name.entry(sub_name.to_lowercase()).or_insert((sub_name, entry_path.clone()));
+                        }
                     }
                 }
             }
         }
+        Ok(Self { by_name, sfv })
     }
-    index
+
+    /// Real path of the file an SFV entry names, if the release has it.
+    fn find(&self, basename: &str) -> Option<PathBuf> {
+        self.by_name
+            .get(&basename.to_lowercase())
+            .map(|(real_name, parent)| parent.join(real_name))
+    }
 }
 
-/// Validate SFV file with completeness checking - check if all listed files exist AND are complete
-/// Returns true if all files listed in the SFV exist and are no longer being written.
-/// This is the function used by inotify_watcher for detecting when downloads are truly complete.
-///
-/// # Arguments
-/// * `sfv_path` - Path to the SFV file
-///
-/// # Returns
-/// * `true` if all files in SFV exist AND are complete (not actively being written)
-/// * `false` if any file is missing, incomplete, or SFV cannot be read
-pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
-    let dir_path = match sfv_path.parent() {
-        Some(p) => p,
-        None => return false,
-    };
+/// The files an SFV lists, as (name as written, basename). Skips comments
+/// (`;`) and blank lines, and strips a leading UTF-8 BOM: PowerShell-generated
+/// SFVs are UTF-8-with-BOM, so the first comment line would otherwise read as
+/// `\u{feff};` and be mistaken for a filename. An entry is `filename CRC32`;
+/// the last space separates the two.
+pub fn listed_files(sfv_content: &str) -> impl Iterator<Item = (&str, &str)> {
+    sfv_content.lines().filter_map(|line| {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with(';') {
+            return None;
+        }
+        let filename = line[..line.rfind(' ')?].trim();
+        let basename = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+        (!basename.is_empty()).then_some((filename, basename))
+    })
+}
 
-    // Read SFV file (use lossy UTF-8 to handle legacy encodings like ISO-8859-1)
-    let content = match std::fs::read(sfv_path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+/// Read an SFV file as text (lossy UTF-8, for legacy encodings like ISO-8859-1).
+pub fn read_sfv(sfv_path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&std::fs::read(sfv_path)?).into_owned())
+}
+
+/// Every file the SFV lists is present in the release.
+pub fn all_listed_files_present(sfv_content: &str, files: &ReleaseFiles) -> bool {
+    for (filename, basename) in listed_files(sfv_content) {
+        if files.find(basename).is_none() {
+            debug!("SFV validation failed: missing file {}", filename);
+            return false;
+        }
+    }
+    true
+}
+
+/// Every file the SFV lists is present AND no longer being written. This is
+/// what inotify_watcher uses to decide a download has finished.
+pub fn validate_sfv_with_completeness(sfv_path: &Path) -> bool {
+    let Some(dir_path) = sfv_path.parent() else { return false };
+    let content = match read_sfv(sfv_path) {
+        Ok(c) => c,
         Err(e) => {
             warn!("Failed to read SFV file {}: {}", sfv_path.display(), e);
             return false;
         }
     };
+    let Ok(files) = ReleaseFiles::read(dir_path) else { return false };
 
-    // Built once, matched case-insensitively below — an SFV's own listed
-    // filenames are frequently lowercased regardless of the actual release's
-    // case (a normal scene convention), so a plain case-sensitive exists()
-    // check can report a fully-downloaded release as permanently missing
-    // files it actually has. filtering.rs's own SFV check already handles
-    // this the same way; this function didn't, which is what let a real,
-    // complete download sit stuck re-failing validation forever instead of
-    // ever notifying Sonarr/Radarr/Emby.
-    let actual_files = index_actual_files(dir_path);
-
-    // Check each file listed in SFV for existence AND completeness
-    for line in content.lines() {
-        // Strip a leading UTF-8 BOM (PowerShell-generated SFVs are UTF-8-with-BOM,
-        // so the first comment line would otherwise read as '\u{feff};' and be
-        // mistaken for a filename).
-        let line = line.trim_start_matches('\u{feff}').trim();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
-
-        // SFV format: filename CRC32 (last space separates name from CRC)
-        if let Some(space_pos) = line.rfind(' ') {
-            let filename = line[..space_pos].trim();
-            if !filename.is_empty() {
-                // SFV entries may reference a subfolder with a Windows separator
-                // (e.g. 'Sample\foo-sample.mkv'); the index above already
-                // flattens subfolder files by basename, so match on that.
-                let base = filename.replace('\\', "/");
-                let base = base.rsplit('/').next().unwrap_or(&base);
-
-                let file_path = match actual_files.get(&base.to_lowercase()) {
-                    Some((real_name, parent)) => parent.join(real_name),
-                    None => {
-                        debug!("SFV validation failed: missing file {}", filename);
-                        return false;
-                    }
-                };
-
-                // Check if file is complete (not actively being written)
-                if !is_file_complete(&file_path) {
-                    debug!("SFV validation deferred: file still being written: {}", filename);
-                    return false;
-                }
-            }
+    for (filename, basename) in listed_files(&content) {
+        let Some(file_path) = files.find(basename) else {
+            debug!("SFV validation failed: missing file {}", filename);
+            return false;
+        };
+        if !is_file_complete(&file_path) {
+            debug!("SFV validation deferred: file still being written: {}", filename);
+            return false;
         }
     }
-
     true
 }
 
@@ -199,43 +200,23 @@ mod tests {
 
         assert!(validate_sfv_with_completeness(&sfv_path));
     }
-}
 
-/// Validate SFV content against a HashMap (used by filtering.rs)
-/// The HashMap allows for future extension (e.g., storing CRC values)
-///
-/// # Arguments
-/// * `sfv_content` - Contents of the SFV file
-/// * `actual_files` - Map of lowercase filename -> original filename
-///
-/// # Returns
-/// * `true` if all files in SFV exist
-/// * `false` if any file is missing
-pub fn validate_sfv_content_with_map(sfv_content: &str, actual_files: &HashMap<String, String>) -> bool {
-    for line in sfv_content.lines() {
-        // Strip a leading UTF-8 BOM (see validate_sfv_with_completeness).
-        let line = line.trim_start_matches('\u{feff}').trim();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
-
-        // SFV format: filename CRC32 (last space separates name from CRC)
-        if let Some(space_pos) = line.rfind(' ') {
-            let filename = line[..space_pos].trim();
-            // SFV entries may carry a subfolder path with Windows or Unix
-            // separators (e.g. 'Sample\foo-sample.mkv'); match on the basename,
-            // since actual_files is keyed by filename.
-            let base = filename
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(filename);
-            if !base.is_empty()
-                && !actual_files.contains_key(&base.to_lowercase()) {
-                    debug!("SFV validation failed: missing file {}", filename);
-                    return false;
-                }
-        }
+    #[test]
+    fn listed_files_skips_bom_comments_and_blank_lines() {
+        let sfv = "\u{feff}; generated by PowerShell\n\nSample\\a-sample.mkv 1234ABCD\nrel.r00 DEADBEEF\n";
+        let listed: Vec<_> = listed_files(sfv).collect();
+        assert_eq!(listed, vec![("Sample\\a-sample.mkv", "a-sample.mkv"), ("rel.r00", "rel.r00")]);
     }
 
-    true
+    #[test]
+    fn release_files_finds_the_sfv_and_checks_presence() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Rel.r00"), b"x").unwrap();
+        fs::write(dir.path().join("rel.sfv"), "rel.r00 DEADBEEF\n").unwrap();
+        let files = ReleaseFiles::read(dir.path()).unwrap();
+
+        assert_eq!(files.sfv, Some(dir.path().join("rel.sfv")));
+        assert!(all_listed_files_present("rel.r00 DEADBEEF\n", &files));
+        assert!(!all_listed_files_present("rel.r01 DEADBEEF\n", &files));
+    }
 }

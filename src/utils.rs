@@ -346,3 +346,53 @@ pub fn write_paths_conf(config: &crate::config::Config, config_path: &std::path:
         }
     }
 }
+
+/// Is anything mounted at `path`, even a dead (stale FUSE) mount? Reads
+/// `/proc/mounts`, which still lists a mount whose process has died, so use
+/// this before mounting or unmounting.
+pub fn mount_listed(path: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return false };
+    mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|mountpoint| Path::new(&unescape_mount_path(mountpoint)) == path)
+}
+
+/// `/proc/mounts` writes space, tab, newline and backslash in paths as octal escapes.
+fn unescape_mount_path(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Is `path` a live mount point? Runs `mountpoint -q`, which stats the path,
+/// so a hung or dead FUSE mount counts as not mounted. A missing `mountpoint`
+/// binary also reads as not mounted.
+pub fn mountpoint_responds(path: &Path) -> bool {
+    std::process::Command::new("mountpoint")
+        .arg("-q")
+        .arg(path)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_paths_are_unescaped() {
+        assert_eq!(unescape_mount_path("/mnt/TV\\040Shows"), "/mnt/TV Shows");
+        assert_eq!(unescape_mount_path("/mnt/plain"), "/mnt/plain");
+    }
+
+    #[test]
+    fn proc_root_is_listed_and_a_plain_dir_is_not() {
+        assert!(mount_listed(Path::new("/proc")));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!mount_listed(dir.path()));
+    }
+}

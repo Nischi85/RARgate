@@ -293,11 +293,6 @@ impl MediaEvent {
             MediaEvent::Created(p) | MediaEvent::Deleted(p) => p,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn is_deletion(&self) -> bool {
-        matches!(self, MediaEvent::Deleted(_))
-    }
 }
 
 /// Implemented by each per-server notifier to plug into `run_debounce_loop`.
@@ -474,7 +469,7 @@ mod tests {
         let path = PathBuf::from("/share/Movies/Test.Movie.2024");
         let event = MediaEvent::Created(path.clone());
         assert_eq!(event.path(), &path);
-        assert!(!event.is_deletion());
+        assert!(matches!(event, MediaEvent::Created(_)));
     }
 
     #[test]
@@ -482,7 +477,7 @@ mod tests {
         let path = PathBuf::from("/share/Movies/Death.Note.2017");
         let event = MediaEvent::Deleted(path.clone());
         assert_eq!(event.path(), &path);
-        assert!(event.is_deletion());
+        assert!(matches!(event, MediaEvent::Deleted(_)));
     }
 
     #[tokio::test]
@@ -494,7 +489,7 @@ mod tests {
         handle.notify(MediaEvent::Created(path.clone())).await;
 
         let received = receiver.recv().await.expect("should receive event");
-        assert!(!received.is_deletion());
+        assert!(matches!(received, MediaEvent::Created(_)));
         assert_eq!(received.path(), &path);
     }
 
@@ -507,7 +502,7 @@ mod tests {
         handle.notify(MediaEvent::Deleted(path.clone())).await;
 
         let received = receiver.recv().await.expect("should receive event");
-        assert!(received.is_deletion());
+        assert!(matches!(received, MediaEvent::Deleted(_)));
         assert_eq!(received.path(), &path);
     }
 

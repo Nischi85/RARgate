@@ -242,10 +242,49 @@ pub struct InotifyWatcher {
     // because the value never changes after initialization — eliminating lock overhead
     // on the inotify hot path.
     cache_invalidation_tx: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<PathBuf>>>,
-    emby_tx: Arc<OnceLock<NotifierHandle>>,
-    jellyfin_tx: Arc<OnceLock<NotifierHandle>>,
-    plex_tx: Arc<OnceLock<NotifierHandle>>,
-    arr_tx: Arc<OnceLock<NotifierHandle>>,
+    notifiers: Notifiers,
+}
+
+/// The notifier handles the watch loop sends to. Each is set at most once,
+/// before start_watching(), so reads need no lock.
+#[derive(Clone, Default)]
+struct Notifiers {
+    emby: Arc<OnceLock<NotifierHandle>>,
+    jellyfin: Arc<OnceLock<NotifierHandle>>,
+    plex: Arc<OnceLock<NotifierHandle>>,
+    arr: Arc<OnceLock<NotifierHandle>>,
+}
+
+impl Notifiers {
+    /// Tell Emby, Jellyfin and Plex that `path` appeared or went away.
+    fn media_servers(&self, path: &Path, is_deletion: bool) {
+        notify(&self.emby, path, is_deletion, "Emby");
+        notify(&self.jellyfin, path, is_deletion, "Jellyfin");
+        notify(&self.plex, path, is_deletion, "Plex");
+    }
+
+    /// Ask Sonarr/Radarr to rescan a newly validated release.
+    fn arr(&self, path: &Path) {
+        notify(&self.arr, path, false, "Arr");
+    }
+}
+
+/// Send one notifier a creation or deletion event, unless it isn't configured or
+/// `path` is a download client's temporary file.
+fn notify(handle: &OnceLock<NotifierHandle>, path: &Path, is_deletion: bool, server_name: &'static str) {
+    if is_temporary_path(path) {
+        debug!("Skipping {} notification for temporary path: {}", server_name, path.display());
+        return;
+    }
+    let Some(handle) = handle.get() else { return };
+    let event = if is_deletion {
+        MediaEvent::Deleted(path.to_path_buf())
+    } else {
+        MediaEvent::Created(path.to_path_buf())
+    };
+    debug!("Sending {} notification (is_deletion={}) for: {}", server_name, is_deletion, event.path().display());
+    let handle = handle.clone();
+    tokio::spawn(async move { handle.notify(event).await; });
 }
 
 /// Runtime context passed into the inotify watch loop.
@@ -340,10 +379,7 @@ impl InotifyWatcher {
             revalidation_threshold_secs,
             metrics: None,
             cache_invalidation_tx: Arc::new(OnceLock::new()),
-            emby_tx: Arc::new(OnceLock::new()),
-            jellyfin_tx: Arc::new(OnceLock::new()),
-            plex_tx: Arc::new(OnceLock::new()),
-            arr_tx: Arc::new(OnceLock::new()),
+            notifiers: Notifiers::default(),
         }
     }
 
@@ -359,25 +395,25 @@ impl InotifyWatcher {
 
     /// Registers the Emby handle. Must be called before start_watching().
     pub fn set_emby_handle(&self, handle: NotifierHandle) {
-        let _ = self.emby_tx.set(handle);
+        let _ = self.notifiers.emby.set(handle);
         info!("Emby notifier connected to inotify watcher");
     }
 
     /// Registers the Jellyfin handle. Must be called before start_watching().
     pub fn set_jellyfin_handle(&self, handle: NotifierHandle) {
-        let _ = self.jellyfin_tx.set(handle);
+        let _ = self.notifiers.jellyfin.set(handle);
         info!("Jellyfin notifier connected to inotify watcher");
     }
 
     /// Registers the Plex handle. Must be called before start_watching().
     pub fn set_plex_handle(&self, handle: NotifierHandle) {
-        let _ = self.plex_tx.set(handle);
+        let _ = self.notifiers.plex.set(handle);
         info!("Plex notifier connected to inotify watcher");
     }
 
     /// Registers the Sonarr/Radarr rescan handle. Must be called before start_watching().
     pub fn set_arr_handle(&self, handle: NotifierHandle) {
-        let _ = self.arr_tx.set(handle);
+        let _ = self.notifiers.arr.set(handle);
         info!("Arr (Sonarr/Radarr) notifier connected to inotify watcher");
     }
 
@@ -434,13 +470,10 @@ impl InotifyWatcher {
             metrics: self.metrics.clone(),
         };
         let cache_tx = self.cache_invalidation_tx.clone();
-        let emby_tx = self.emby_tx.clone();
-        let jellyfin_tx = self.jellyfin_tx.clone();
-        let plex_tx = self.plex_tx.clone();
-        let arr_tx = self.arr_tx.clone();
+        let notifiers = self.notifiers.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
-            if let Err(e) = Self::watch_loop(ctx, cache_tx, emby_tx, jellyfin_tx, plex_tx, arr_tx) {
+            if let Err(e) = Self::watch_loop(ctx, cache_tx, notifiers) {
                 error!("Inotify watch loop failed: {}", e);
             }
         });
@@ -469,10 +502,7 @@ impl InotifyWatcher {
     fn watch_loop(
         ctx: WatchLoopContext,
         cache_tx: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<PathBuf>>>,
-        emby_tx: Arc<OnceLock<NotifierHandle>>,
-        jellyfin_tx: Arc<OnceLock<NotifierHandle>>,
-        plex_tx: Arc<OnceLock<NotifierHandle>>,
-        arr_tx: Arc<OnceLock<NotifierHandle>>,
+        notifiers: Notifiers,
     ) -> Result<()> {
         // Unpack context fields for convenient access
         let verified_path = ctx.verified_path.as_path();
@@ -657,9 +687,7 @@ impl InotifyWatcher {
 
                         if should_notify {
                             announced_dirs.put(dir_path.clone(), now);
-                            Self::notify_server(&emby_tx, &dir_path, false, "Emby");
-                            Self::notify_server(&jellyfin_tx, &dir_path, false, "Jellyfin");
-                            Self::notify_server(&plex_tx, &dir_path, false, "Plex");
+                            notifiers.media_servers(&dir_path, false);
                             // Sonarr/Radarr get a rescan ONLY on the first announce — that's the
                             // authoritative "the release is now visible, import it in place"
                             // moment. A later change to an already-imported release (a subtitle
@@ -669,7 +697,7 @@ impl InotifyWatcher {
                             // see the media file and mark it MissingFromDisk. Media servers
                             // still get poked so external subs show up promptly.
                             if is_first_announce {
-                                Self::notify_server(&arr_tx, &dir_path, false, "Arr");
+                                notifiers.arr(&dir_path);
                             }
                         }
 
@@ -901,9 +929,7 @@ impl InotifyWatcher {
                                     // directory-deletion block below to avoid duplicate notifications.
                                     if !event.mask.contains(EventMask::ISDIR) {
                                         debug!("Verified path file deletion, notifying directly: {}", full_path.display());
-                                        Self::notify_server(&emby_tx, &full_path, true, "Emby");
-                                        Self::notify_server(&jellyfin_tx, &full_path, true, "Jellyfin");
-                                        Self::notify_server(&plex_tx, &full_path, true, "Plex");
+                                        notifiers.media_servers(&full_path, true);
                                     }
                                     // Clean up pending/failure state for the deleted dir
                                     pending_dirs.pop(&event_dir);
@@ -946,9 +972,7 @@ impl InotifyWatcher {
                         // UNVERIFIED PATH: Notify immediately (no SFV required)
                         debug!("Unverified path, notifying immediately (is_deletion={}) for: {}",
                                is_deletion_event, full_path.display());
-                        Self::notify_server(&emby_tx, &full_path, is_deletion_event, "Emby");
-                        Self::notify_server(&jellyfin_tx, &full_path, is_deletion_event, "Jellyfin");
-                        Self::notify_server(&plex_tx, &full_path, is_deletion_event, "Plex");
+                        notifiers.media_servers(&full_path, is_deletion_event);
                     }
 
                     // Handle directory creation or move - watch new directories
@@ -997,9 +1021,7 @@ impl InotifyWatcher {
                         failed_validations.pop(&full_path);
                         if let Some(m) = metrics { m.clear_stuck(&full_path); }
                         // Notify media servers that this directory is gone
-                        Self::notify_server(&emby_tx, &full_path, true, "Emby");
-                        Self::notify_server(&jellyfin_tx, &full_path, true, "Jellyfin");
-                        Self::notify_server(&plex_tx, &full_path, true, "Plex");
+                        notifiers.media_servers(&full_path, true);
                     } else if event.mask.contains(EventMask::DELETE) && event.mask.contains(EventMask::ISDIR) {
                         // A subdirectory was deleted - only clean up pending_dirs
                         // DON'T remove from watch_descriptors (event.wd is the parent's watch!)
@@ -1008,9 +1030,7 @@ impl InotifyWatcher {
                         failed_validations.pop(&full_path);
                         if let Some(m) = metrics { m.clear_stuck(&full_path); }
                         // Notify media servers that this subdirectory is gone
-                        Self::notify_server(&emby_tx, &full_path, true, "Emby");
-                        Self::notify_server(&jellyfin_tx, &full_path, true, "Jellyfin");
-                        Self::notify_server(&plex_tx, &full_path, true, "Plex");
+                        notifiers.media_servers(&full_path, true);
                     }
                 }
             }
@@ -1333,30 +1353,6 @@ impl InotifyWatcher {
             }
             Err(e) => warn!("Overlay fallback: cannot open drop_caches ({}); is rargate root?", e),
         }
-    }
-
-    /// Notify a media server of a file change (creation or deletion).
-    /// Skips temporary download-client paths. Uses OnceLock — no lock needed after startup.
-    fn notify_server(
-        handle: &Arc<OnceLock<NotifierHandle>>,
-        path: &Path,
-        is_deletion: bool,
-        server_name: &'static str,
-    ) {
-        if is_temporary_path(path) {
-            debug!("Skipping {} notification for temporary path: {}", server_name, path.display());
-            return;
-        }
-        let Some(handle) = handle.get() else { return };
-        // OnceLock: no lock needed — handle is immutable after startup
-        let event = if is_deletion {
-            MediaEvent::Deleted(path.to_path_buf())
-        } else {
-            MediaEvent::Created(path.to_path_buf())
-        };
-        debug!("Sending {} notification (is_deletion={}) for: {}", server_name, is_deletion, event.path().display());
-        let handle = handle.clone();
-        tokio::spawn(async move { handle.notify(event).await; });
     }
 }
 

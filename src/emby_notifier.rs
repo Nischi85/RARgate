@@ -905,11 +905,11 @@ mod tests {
         handle.notify(MediaEvent::Deleted(deleted_path.clone())).await;
 
         let ev1 = receiver.recv().await.unwrap();
-        assert!(!ev1.is_deletion(), "first event should be a creation");
+        assert!(matches!(ev1, MediaEvent::Created(_)), "first event should be a creation");
         assert_eq!(ev1.path(), &created_path);
 
         let ev2 = receiver.recv().await.unwrap();
-        assert!(ev2.is_deletion(), "second event should be a deletion");
+        assert!(matches!(ev2, MediaEvent::Deleted(_)), "second event should be a deletion");
         assert_eq!(ev2.path(), &deleted_path);
     }
 }

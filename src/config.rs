@@ -441,7 +441,7 @@ impl Config {
         }
 
         // Check if already mounted
-        if is_mounted(&self.mountpoint)? {
+        if crate::utils::mountpoint_responds(&self.mountpoint) {
             anyhow::bail!("Mountpoint already in use: {}", self.mountpoint.display());
         }
 
@@ -726,16 +726,6 @@ impl Config {
 
         Ok(())
     }
-}
-
-fn is_mounted(path: &std::path::Path) -> Result<bool> {
-    let output = std::process::Command::new("mountpoint")
-        .arg("-q")
-        .arg(path)
-        .output()
-        .context("Failed to check if path is mounted")?;
-
-    Ok(output.status.success())
 }
 
 /// Lightweight HTTP(S) URL sanity check for media-server config values.
