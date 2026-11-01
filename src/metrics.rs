@@ -135,6 +135,16 @@ impl MetricsCollector {
         }
     }
 
+    /// Drop stuck releases whose directory no longer exists; returns the dropped paths.
+    pub fn prune_missing_stuck(&self) -> Vec<PathBuf> {
+        let Ok(mut map) = self.stuck_releases.lock() else { return Vec::new() };
+        let gone: Vec<PathBuf> = map.keys().filter(|p| !p.exists()).cloned().collect();
+        for p in &gone {
+            map.remove(p);
+        }
+        gone
+    }
+
     /// Write current counters to a JSON status file.
     pub fn write_status_file(&self, path: &Path, version: &str) {
         let uptime = self.uptime_seconds();
@@ -313,4 +323,25 @@ pub fn metrics_config(
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATUS_FILE));
     let interval = cfg.update_interval_seconds.unwrap_or(DEFAULT_UPDATE_INTERVAL_SECS);
     Some((path, interval))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_missing_stuck_drops_only_deleted_dirs() {
+        let base = tempfile::tempdir().unwrap();
+        let kept = base.path().join("Still.Here.2020-GRP");
+        std::fs::create_dir(&kept).unwrap();
+        let gone = base.path().join("Deleted.1995-GRP");
+
+        let m = MetricsCollector::new();
+        m.record_stuck(&kept, 3, SystemTime::now());
+        m.record_stuck(&gone, 3, SystemTime::now());
+
+        assert_eq!(m.prune_missing_stuck(), vec![gone.clone()]);
+        let map = m.stuck_releases.lock().unwrap();
+        assert!(map.contains_key(&kept) && !map.contains_key(&gone));
+    }
 }

@@ -995,6 +995,7 @@ impl InotifyWatcher {
                         watch_descriptors.remove(&event.wd);
                         pending_dirs.pop(&full_path);
                         failed_validations.pop(&full_path);
+                        if let Some(m) = metrics { m.clear_stuck(&full_path); }
                         // Notify media servers that this directory is gone
                         Self::notify_server(&emby_tx, &full_path, true, "Emby");
                         Self::notify_server(&jellyfin_tx, &full_path, true, "Jellyfin");
@@ -1005,6 +1006,7 @@ impl InotifyWatcher {
                         // The deleted directory's watch will be cleaned up by its own DELETE_SELF event
                         pending_dirs.pop(&full_path);
                         failed_validations.pop(&full_path);
+                        if let Some(m) = metrics { m.clear_stuck(&full_path); }
                         // Notify media servers that this subdirectory is gone
                         Self::notify_server(&emby_tx, &full_path, true, "Emby");
                         Self::notify_server(&jellyfin_tx, &full_path, true, "Jellyfin");
@@ -1031,6 +1033,13 @@ impl InotifyWatcher {
                 for key in failure_keys_to_remove {
                     failed_validations.pop(&key);
                     if let Some(m) = metrics { m.clear_stuck(&key); }
+                }
+                // A stuck release deleted without a delete event reaching us
+                // (e.g. its parent removed first) would otherwise stay listed forever.
+                if let Some(m) = metrics {
+                    for gone in m.prune_missing_stuck() {
+                        failed_validations.pop(&gone);
+                    }
                 }
 
                 // Clean up old notified entries from pending_dirs to prevent memory growth
