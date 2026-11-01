@@ -235,7 +235,7 @@ impl FilterEngine {
         if let Some(sfv_config) = &hot.sfv_config {
             if sfv_config.enabled {
                 drop(hot); // release lock before the potentially slow SFV path
-                return self.is_file_allowed_by_sfv(parent_path, filename);
+                return self.is_file_allowed_by_sfv(parent_path);
             }
         }
 
@@ -410,7 +410,7 @@ impl FilterEngine {
         }
     }
 
-    fn is_file_allowed_by_sfv(&self, dir_path: &Path, _filename: &str) -> bool {
+    fn is_file_allowed_by_sfv(&self, dir_path: &Path) -> bool {
         let (permissive_validates, lazy_mode) = {
             let hot = self.hot.read().unwrap();
             (
@@ -521,26 +521,23 @@ impl FilterEngine {
         None
     }
 
-    /// Get directory information with SFV validation caching.
+    /// Should this directory be shown? Cached for `cache_ttl`.
     ///
-    /// Phases:
-    ///   1. **Cache lookup** — return immediately on a fresh `dir_cache` hit.
-    ///   2. **Backend probe** — scan the rar2fs-extracted listing for files with media
-    ///      extensions. No media → directory is hidden (returns "not visible").
-    ///   3. **Source-layer SFV read** — for the same path on the source overlay,
-    ///      locate `.sfv` files and validate per the configured mode
-    ///      (`strict`/`permissive`). SFV lives on the source, not the backend, because
-    ///      rar2fs doesn't surface non-archived files.
-    ///   4. **Decision & cache write** — combine the media probe and SFV result into a
-    ///      `DirectoryInfo`, store it in `dir_cache`, return.
+    /// 1. **Cache** — a fresh `dir_cache` entry is returned as is.
+    /// 2. **Media probe** — the rar2fs backend listing is scanned for media files.
+    ///    None means a parent directory (category, series, season), which is shown
+    ///    without an SFV check.
+    /// 3. **SFV check** — a directory holding media is checked against the `.sfv` in
+    ///    its SOURCE layer (verified/unverified), which has the RAR parts the SFV
+    ///    lists; the backend only shows the extracted media.
     ///
-    /// The cache TTL and the strict/permissive split are read from `self.hot` under a
-    /// short-lived `RwLock` so SIGHUP reloads pick up without blocking ongoing reads.
+    /// Any directory that can't be read is shown. Hot-reloadable settings are read
+    /// from `self.hot` under a short-lived lock, so SIGHUP reloads apply without
+    /// blocking ongoing reads.
     fn get_directory_info(&self, backend_dir_path: &Path) -> DirectoryInfo {
         let now = SystemTime::now();
 
-        // Check cache first. Also remember the prior decision (even if the entry is stale)
-        // so we can log the hidden -> visible transition once when a directory becomes OK.
+        // Remember the prior decision even when stale, to log a hidden -> visible flip below.
         let mut prev_should_show: Option<bool> = None;
         if let Some(entry) = self.dir_cache.get(backend_dir_path) {
             prev_should_show = Some(entry.should_show);
@@ -551,147 +548,51 @@ impl FilterEngine {
                 return entry.clone();
             }
         }
-
         if let Some(metrics) = &self.metrics {
             metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
         // Snapshot hot-reloadable config once — holds lock only for the clone, not I/O
-        let (media_extensions, sfv_config_snap) = {
+        let (media_extensions, permissive_validates) = {
             let hot = self.hot.read().unwrap();
-            (Arc::clone(&hot.media_extensions), hot.sfv_config.clone())
+            (
+                Arc::clone(&hot.media_extensions),
+                hot.sfv_config.as_ref().and_then(|c| c.permissive_validates_sfv).unwrap_or(false),
+            )
         };
 
-        // Get the actual source layer path (bypasses overlay cache)
         let (source_path, layer_type) = self.get_source_layer_path(backend_dir_path)
             .unwrap_or_else(|| (backend_dir_path.to_path_buf(), String::new()));
 
-        // For SFV validation, we MUST read from the SOURCE layer (verified/unverified), NOT the rar2fs backend!
-        // The rar2fs backend shows extracted media files, but SFV lists RAR archive parts.
-        // We check media files from backend (for has_media detection), but RAR parts from source.
-
-        // First, read backend for media file detection — gate concurrent walks via the
-        // shared rar2fs limiter to keep parallel validations from saturating rar2fs.
-        let mut has_media = false;
-        {
-            let _permit = self.rar2fs_limiter.acquire();
-            let backend_entries = match std::fs::read_dir(backend_dir_path) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    warn!("Failed to read backend directory {}: {}", backend_dir_path.display(), e);
-                    let info = DirectoryInfo {
-                        should_show: true,
-                        timestamp: now,
-                    };
-                    self.dir_cache.insert(backend_dir_path.to_path_buf(), info.clone());
-                    return info;
-                }
-            };
-
-            for entry in backend_entries.flatten() {
-                let entry_path = entry.path();
-                if entry_path.is_file() {
-                    // O(1) HashSet lookup: find the dot, slice extension, check membership
-                    let lower_name = entry.file_name().to_string_lossy().to_lowercase();
-                    if let Some(dot_pos) = lower_name.rfind('.') {
-                        if media_extensions.contains(&lower_name[dot_pos..]) {
-                            has_media = true;
-                            break;
-                        }
-                    }
-                }
+        match self.has_media_files(backend_dir_path, &media_extensions) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("Directory {} has no media files (parent dir), skipping source read", source_path.display());
+                return self.remember(backend_dir_path, true, now);
+            }
+            Err(e) => {
+                warn!("Failed to read backend directory {}: {}", backend_dir_path.display(), e);
+                return self.remember(backend_dir_path, true, now);
             }
         }
 
-        // OPTIMIZATION: If no media files found, this is a parent directory
-        // Skip source layer read entirely - no SFV validation needed
-        if !has_media {
-            debug!("Directory {} has no media files (parent dir), skipping source read", source_path.display());
-            let info = DirectoryInfo {
-                should_show: true,
-                timestamp: now,
-            };
-            self.dir_cache.insert(backend_dir_path.to_path_buf(), info.clone());
-            return info;
-        }
-
-        // Now read SOURCE layer (verified/unverified) for SFV validation - this has the actual RAR files
-        // Only done for directories with media files (need SFV validation)
         let release_files = match ReleaseFiles::read(&source_path) {
             Ok(files) => files,
             Err(e) => {
                 warn!("Failed to read directory {}: {}", backend_dir_path.display(), e);
-                let info = DirectoryInfo {
-                    should_show: true,
-                    timestamp: now,
-                };
-                self.dir_cache.insert(backend_dir_path.to_path_buf(), info.clone());
-                return info;
+                return self.remember(backend_dir_path, true, now);
             }
         };
-        let has_sfv = release_files.sfv.is_some();
-        let sfv_file_path = release_files.sfv.clone();
 
-        // Determine if should show (only for directories with media files)
-        let should_show = {
-            // Determine mode
-            let sfv_mode = if !layer_type.is_empty() {
-                match layer_type.as_str() {
-                    "verified" => SfvMode::Strict,
-                    "unverified" => SfvMode::Permissive,
-                    _ => self.get_sfv_mode(backend_dir_path),
-                }
-            } else {
-                self.get_sfv_mode(backend_dir_path)
-            };
-
-            debug!("SFV validation for {}: mode={:?}, layer={}, hasSFV={}",
-                  source_path.display(), sfv_mode, layer_type, has_sfv);
-
-            let permissive_validates = sfv_config_snap.as_ref()
-                .and_then(|c| c.permissive_validates_sfv)
-                .unwrap_or(false);
-
-            match sfv_mode {
-                SfvMode::Permissive if !permissive_validates => true,
-                SfvMode::Permissive => {
-                    // permissive_validates_sfv enabled: validate if SFV exists, show if absent
-                    if !has_sfv {
-                        true
-                    } else if let Some(ref sfv_path) = sfv_file_path {
-                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &release_files);
-                        if !sfv_valid {
-                            debug!("Hiding directory {} (permissive mode, SFV present but validation failed)", backend_dir_path.display());
-                            self.log_sfv_failure(backend_dir_path, "permissive mode, SFV validation failed", true, has_sfv);
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                }
-                SfvMode::Strict => {
-                    if !has_sfv {
-                        debug!("Hiding directory {} (strict mode, no SFV file)", backend_dir_path.display());
-                        self.log_sfv_failure(backend_dir_path, "strict mode, no SFV file", true, has_sfv);
-                        false
-                    } else if let Some(ref sfv_path) = sfv_file_path {
-                        // Validate SFV contents in strict mode using pre-built file list (PERFORMANCE FIX)
-                        let sfv_valid = self.validate_sfv_file_with_files(sfv_path, &release_files);
-                        if !sfv_valid {
-                            debug!("Hiding directory {} (strict mode, SFV validation failed)", backend_dir_path.display());
-                            self.log_sfv_failure(backend_dir_path, "strict mode, SFV validation failed", true, has_sfv);
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                }
-            }
+        // The layer decides the mode when known: verified is strict, unverified permissive.
+        let sfv_mode = match layer_type.as_str() {
+            "verified" => SfvMode::Strict,
+            "unverified" => SfvMode::Permissive,
+            _ => self.get_sfv_mode(backend_dir_path),
         };
+        debug!("SFV validation for {}: mode={:?}, layer={}, hasSFV={}",
+              source_path.display(), sfv_mode, layer_type, release_files.sfv.is_some());
+        let should_show = self.passes_sfv_check(backend_dir_path, sfv_mode, permissive_validates, &release_files);
 
         // Log the transition from hidden to visible once, so it is clear in the log when a
         // directory that was previously failing validation has become OK to show. Only fires
@@ -699,24 +600,62 @@ impl FilterEngine {
         if should_show && prev_should_show == Some(false) {
             info!("Directory now passes validation, showing: {}", backend_dir_path.display());
         }
-
-        // Track SFV validation outcome (only when media files were present and evaluated)
-        if has_media {
-            if let Some(metrics) = &self.metrics {
-                if should_show {
-                    metrics.sfv_validations_passed.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.sfv_validations_failed.fetch_add(1, Ordering::Relaxed);
-                }
+        if let Some(metrics) = &self.metrics {
+            if should_show {
+                metrics.sfv_validations_passed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.sfv_validations_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let info = DirectoryInfo {
-            should_show,
-            timestamp: now,
-        };
+        self.remember(backend_dir_path, should_show, now)
+    }
 
-        self.dir_cache.insert(backend_dir_path.to_path_buf(), info.clone());
+    /// Does the backend listing hold a media file? The walk is gated by the shared
+    /// rar2fs limiter so parallel validations can't saturate rar2fs.
+    fn has_media_files(&self, backend_dir_path: &Path, media_extensions: &HashSet<String>) -> std::io::Result<bool> {
+        let _permit = self.rar2fs_limiter.acquire();
+        for entry in std::fs::read_dir(backend_dir_path)?.flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let lower_name = entry.file_name().to_string_lossy().to_lowercase();
+            if lower_name.rfind('.').is_some_and(|dot| media_extensions.contains(&lower_name[dot..])) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The SFV verdict for a directory holding media. Strict mode requires an SFV
+    /// whose files are all present. Permissive mode shows everything, unless
+    /// `permissive_validates_sfv` is set: then an SFV, when present, must check out.
+    fn passes_sfv_check(&self, dir: &Path, mode: SfvMode, permissive_validates: bool, release_files: &ReleaseFiles) -> bool {
+        let mode_name = match mode {
+            SfvMode::Strict => "strict",
+            SfvMode::Permissive if !permissive_validates => return true,
+            SfvMode::Permissive => "permissive",
+        };
+        let Some(sfv_path) = &release_files.sfv else {
+            if mode == SfvMode::Permissive {
+                return true;
+            }
+            debug!("Hiding directory {} (strict mode, no SFV file)", dir.display());
+            self.log_sfv_failure(dir, "strict mode, no SFV file", true, false);
+            return false;
+        };
+        if self.validate_sfv_file_with_files(sfv_path, release_files) {
+            return true;
+        }
+        debug!("Hiding directory {} ({} mode, SFV validation failed)", dir.display(), mode_name);
+        self.log_sfv_failure(dir, &format!("{mode_name} mode, SFV validation failed"), true, true);
+        false
+    }
+
+    /// Cache a show/hide decision for `dir` and return it.
+    fn remember(&self, dir: &Path, should_show: bool, now: SystemTime) -> DirectoryInfo {
+        let info = DirectoryInfo { should_show, timestamp: now };
+        self.dir_cache.insert(dir.to_path_buf(), info.clone());
         info
     }
 
@@ -893,5 +832,37 @@ mod tests {
 
         assert_eq!(results.get("Movies"), Some(&true));
         assert_eq!(results.get("Anything"), Some(&true));
+    }
+
+    /// A release directory with one RAR part and, optionally, an SFV listing one file.
+    fn release(sfv_lists: Option<&str>) -> (tempfile::TempDir, ReleaseFiles) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rel.r00"), b"x").unwrap();
+        if let Some(listed) = sfv_lists {
+            std::fs::write(dir.path().join("rel.sfv"), format!("{listed} DEADBEEF\n")).unwrap();
+        }
+        let files = ReleaseFiles::read(dir.path()).unwrap();
+        (dir, files)
+    }
+
+    #[test]
+    fn strict_mode_needs_a_complete_sfv() {
+        let engine = test_engine(None);
+        let check = |files: &ReleaseFiles| engine.passes_sfv_check(Path::new("/d"), SfvMode::Strict, false, files);
+        assert!(!check(&release(None).1), "no SFV");
+        assert!(!check(&release(Some("rel.r01")).1), "SFV lists a missing part");
+        assert!(check(&release(Some("rel.r00")).1));
+    }
+
+    #[test]
+    fn permissive_mode_shows_everything_unless_told_to_validate() {
+        let engine = test_engine(None);
+        let check = |validates, files: &ReleaseFiles| {
+            engine.passes_sfv_check(Path::new("/d"), SfvMode::Permissive, validates, files)
+        };
+        assert!(check(false, &release(Some("rel.r01")).1));
+        assert!(check(true, &release(None).1), "no SFV: nothing to validate");
+        assert!(!check(true, &release(Some("rel.r01")).1));
+        assert!(check(true, &release(Some("rel.r00")).1));
     }
 }
