@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Write protection: files listed in an SFV that starts with a UTF-8 BOM are now all
+  protected. The first entry of such an SFV was previously read as a different name and
+  left writable.
+- Resource monitor: the rar2fs resource log now follows the rar2fs process serving its
+  own instance's backend mount, including after a rar2fs restart. It previously used the
+  PID found at startup, falling back to the first `rar2fs` process on the system, which
+  could belong to another instance.
+- Internal: SFV parsing, mount checks and the inotify watch loop were restructured for
+  readability; no behaviour change beyond the two fixes above.
+
 ## v1.4.0
 
 - inotify: a Sonarr/Radarr rescan now fires only on a release's **first** announce (the
