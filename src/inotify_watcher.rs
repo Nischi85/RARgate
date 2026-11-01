@@ -7,21 +7,21 @@
 //! 2. **Media-server notifications** — emits `MediaEvent::Created` / `Deleted` to the
 //!    Emby / Jellyfin / Plex notifiers via their `NotifierHandle`s.
 //!
-//! Three bounded LRUs prevent unbounded memory growth: `pending_dirs` (awaiting SFV
-//! check), `failed_validations` (backoff tracking), `temp_path_last_logged`
-//! (rate-limits debug spam).
+//! The loop itself is `WatchLoop`; its per-directory state lives in bounded LRUs so
+//! memory can't grow without limit.
 
 use anyhow::Result;
-use inotify::{Inotify, WatchMask, EventMask};
+use inotify::{Event, EventMask, Events, Inotify, WatchDescriptor, WatchMask};
 use lru::LruCache;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, debug, warn, error};
 
 use crate::config::{OverlayConfig, ValidationBackoffConfig, WatcherConfig};
@@ -49,6 +49,12 @@ struct PendingDirectory {
     notified: bool,
     /// Timestamp when notification was sent (for cleanup and re-validation)
     notified_at: Option<Instant>,
+}
+
+impl PendingDirectory {
+    fn new() -> Self {
+        Self { last_event: Instant::now(), notified: false, notified_at: None }
+    }
 }
 
 /// Companion/sidecar file extensions (subtitles, metadata, scratch). These are written and
@@ -287,9 +293,7 @@ fn notify(handle: &OnceLock<NotifierHandle>, path: &Path, is_deletion: bool, ser
     tokio::spawn(async move { handle.notify(event).await; });
 }
 
-/// Runtime context passed into the inotify watch loop.
-/// Groups all configuration parameters into a single struct so watch_loop() avoids
-/// a 13-parameter signature. All fields are owned so the struct can be moved into
+/// The watch loop's configuration. All fields are owned so it can be moved into
 /// spawn_blocking (which requires 'static bounds).
 struct WatchLoopContext {
     verified_path: PathBuf,
@@ -417,25 +421,6 @@ impl InotifyWatcher {
         info!("Arr (Sonarr/Radarr) notifier connected to inotify watcher");
     }
 
-    /// Main watch loop (runs in blocking thread)
-    /// Get maximum number of watches allowed based on system limit
-    /// Reads from /proc/sys/fs/inotify/max_user_watches and uses 80% of it
-    /// Returns (max_watches, system_limit)
-    fn get_max_watches() -> (usize, usize) {
-        let system_limit = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(8192); // Conservative fallback if unable to read system limit
-
-        // Use 80% of system limit (leave 20% headroom for other applications)
-        let max_watches = (system_limit * 80) / 100;
-
-        info!("System inotify limit: {} watches", system_limit);
-        info!("RARGate will use up to {} watches (80% of system limit)", max_watches);
-
-        (max_watches, system_limit)
-    }
-
     /// Start watching both overlay layers
     pub async fn start_watching(&self) -> Result<tokio::task::JoinHandle<()>> {
         info!("Starting inotify watcher for overlay layers");
@@ -473,100 +458,78 @@ impl InotifyWatcher {
         let notifiers = self.notifiers.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
-            if let Err(e) = Self::watch_loop(ctx, cache_tx, notifiers) {
-                error!("Inotify watch loop failed: {}", e);
+            match WatchLoop::new(ctx, cache_tx, notifiers) {
+                Ok(watch_loop) => watch_loop.run(),
+                Err(e) => error!("Inotify watch loop failed: {}", e),
             }
         });
 
         Ok(handle)
     }
+}
 
-    /// Main watch loop (runs in blocking thread).
-    ///
-    /// Three concurrent concerns are interleaved in a single thread to keep the
-    /// inotify file descriptor's locality tight:
-    ///
-    ///   (A) **Event polling** — `poll()` on the inotify FD with a short timeout;
-    ///       when events arrive, classify each path (verified vs unverified layer,
-    ///       directory vs file) and update the relevant pending-directory state.
-    ///   (B) **Debounce-ready dirs** — every loop iteration, walk `pending_dirs` and
-    ///       trigger SFV validation for any directory whose debounce window has
-    ///       expired. Successful validations emit `MediaEvent::Created` to the
-    ///       notifiers and an invalidation message to the FUSE cache; failures move
-    ///       to `failed_validations` with exponential backoff.
-    ///   (C) **Failed-validation retry** — directories in `failed_validations` are
-    ///       re-checked once their cooldown elapses, up to `max_validation_failures`,
-    ///       at which point they're dropped (loud failure, logged for investigation).
-    ///
-    /// All three caches are bounded `LruCache`s — see the constants above for sizing.
-    fn watch_loop(
+/// Interval for the "skipping temporary path" debug line, per path.
+const TEMP_PATH_LOG_INTERVAL_SECS: u64 = 5;
+
+/// How long one wait for inotify events lasts; the debounce checks run at least this often.
+const POLL_TIMEOUT_MS: u16 = 1000;
+
+/// Directory depth below each watched layer that gets inotify watches.
+const MAX_WATCH_DEPTH: usize = 10;
+
+fn lru<V>(size: usize) -> LruCache<PathBuf, V> {
+    LruCache::new(NonZeroUsize::new(size).unwrap())
+}
+
+/// The watch loop and the state it keeps between iterations. Runs on a blocking thread.
+///
+/// Each iteration:
+///   1. waits up to a second for inotify events;
+///   2. SFV-validates every pending release directory whose files have been quiet
+///      for the debounce window — a pass announces it to the media servers, a
+///      failure backs off and, if it persists, reports the release as stuck;
+///   3. handles the events: cache invalidation, overlay refresh, queueing release
+///      directories for validation, watching new directories, forgetting deleted ones;
+///   4. once a minute, prunes the bounded caches.
+struct WatchLoop {
+    ctx: WatchLoopContext,
+    cache_tx: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<PathBuf>>>,
+    notifiers: Notifiers,
+    inotify: Inotify,
+    /// Watched directory for each watch descriptor.
+    watch_descriptors: HashMap<WatchDescriptor, PathBuf>,
+    max_watches: usize,
+    /// Release directories waiting for SFV validation once their files settle.
+    pending_dirs: LruCache<PathBuf, PendingDirectory>,
+    /// Directories failing SFV validation, for backoff and stuck reporting.
+    failed_validations: LruCache<PathBuf, FailedValidation>,
+    /// When the "skipping temporary path" debug line was last logged, per path.
+    temp_path_last_logged: LruCache<PathBuf, Instant>,
+    /// Coalesces overlay-cache refreshes of the same directory. A release landing
+    /// fires one event per file, each of which would otherwise re-read the same
+    /// directory through rar2fs (see `refresh_overlay_cache`).
+    overlay_refresh_last: LruCache<PathBuf, Instant>,
+    /// Directories already announced as media. Outlives `pending_dirs`, so a later
+    /// change (a subtitle added) re-notifies quietly instead of re-announcing
+    /// "New media dir", and a validation failure here counts as a regression.
+    announced_dirs: LruCache<PathBuf, Instant>,
+    last_cleanup: Instant,
+}
+
+impl WatchLoop {
+    /// Set up inotify and watch both overlay layers recursively, within the system's watch limit.
+    fn new(
         ctx: WatchLoopContext,
         cache_tx: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<PathBuf>>>,
         notifiers: Notifiers,
-    ) -> Result<()> {
-        // Unpack context fields for convenient access
-        let verified_path = ctx.verified_path.as_path();
-        let unverified_path = ctx.unverified_path.as_path();
-        let overlay_merged_path = ctx.overlay_merged_path.as_deref();
-        let rar2fs_backend_path = ctx.rar2fs_backend_path.as_path();
-        let exclude_dirs: &[String] = &ctx.exclude_dirs;
-        let metrics = ctx.metrics.as_ref();
-        let max_validation_failures = ctx.max_validation_failures;
-        let validation_cooldown_secs = ctx.validation_cooldown_secs;
-        let escalation_threshold = ctx.escalation_threshold;
-        let regression_escalation_threshold = ctx.regression_escalation_threshold;
-        let sfv_debounce_secs = ctx.sfv_debounce_secs;
-        let pending_cleanup_secs = ctx.pending_cleanup_secs;
-        let revalidation_threshold_secs = ctx.revalidation_threshold_secs;
+    ) -> Result<Self> {
         let mut inotify = Inotify::init()?;
         let mut watch_descriptors = HashMap::new();
-
-        // Pending directories waiting for SFV validation after debounce
-        // LRU cache bounds memory growth (10,000 entries max)
-        let mut pending_dirs: LruCache<PathBuf, PendingDirectory> = LruCache::new(
-            NonZeroUsize::new(LRU_PENDING_DIRS_SIZE).unwrap()
-        );
-
-        // Track directories that have failed SFV validation for backoff
-        // LRU cache bounds memory growth (5,000 entries max)
-        let mut failed_validations: LruCache<PathBuf, FailedValidation> = LruCache::new(
-            NonZeroUsize::new(LRU_FAILED_VALIDATIONS_SIZE).unwrap()
-        );
-
-        // Rate-limit debug logging for temporary paths (once per 5s per path)
-        // LRU cache bounds memory growth (1,000 entries max)
-        let mut temp_path_last_logged: LruCache<PathBuf, Instant> = LruCache::new(
-            NonZeroUsize::new(LRU_TEMP_PATH_LOG_SIZE).unwrap()
-        );
-        const TEMP_PATH_LOG_INTERVAL_SECS: u64 = 5;
-
-        // Coalesce rapid duplicate overlay-cache refreshes for the same directory. A
-        // multi-file release landing fires one inotify event per file, each of which
-        // would otherwise re-readdir rar2fs for the same parent dir — amplifying load
-        // on every SFV pass. Keyed on the directory; short TTL so genuine later updates
-        // still refresh (worst-case visibility lag = OVERLAY_REFRESH_DEDUPE_SECS).
-        let mut overlay_refresh_last: LruCache<PathBuf, Instant> = LruCache::new(
-            NonZeroUsize::new(LRU_TEMP_PATH_LOG_SIZE).unwrap()
-        );
-
-        // Directories already announced as media to the servers. Survives the pending_dirs
-        // churn so that a re-validation (e.g. after a subtitle is added) is logged quietly as
-        // a re-notification instead of re-announcing "New media dir".
-        let mut announced_dirs: LruCache<PathBuf, Instant> = LruCache::new(
-            NonZeroUsize::new(LRU_PENDING_DIRS_SIZE).unwrap()
-        );
-
-        // Track last cleanup time - cleanup runs every CLEANUP_INTERVAL_SECS
-        let mut last_cleanup = Instant::now();
-
-        // Watch both paths recursively with limits to prevent exhausting system resources
-        let mut watch_count = 0;
         let (max_watches, system_limit) = Self::get_max_watches();
-        const MAX_DEPTH: usize = 10; // Limit depth to prevent excessive recursion
-        let limits = WatchLimits { max_depth: MAX_DEPTH, max_watches, exclude_dirs };
-
-        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, verified_path, 0, &mut watch_count, &limits)?;
-        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, unverified_path, 0, &mut watch_count, &limits)?;
+        let limits = WatchLimits { max_depth: MAX_WATCH_DEPTH, max_watches, exclude_dirs: &ctx.exclude_dirs };
+        let mut watch_count = 0;
+        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, &ctx.verified_path, 0, &mut watch_count, &limits)?;
+        Self::add_watch_recursive_limited(&mut inotify, &mut watch_descriptors, &ctx.unverified_path, 0, &mut watch_count, &limits)?;
 
         if watch_count >= max_watches {
             let percentage = (max_watches * 100) / system_limit;
@@ -577,534 +540,536 @@ impl InotifyWatcher {
         }
         info!("Inotify watching {} paths ({} watches used, {} available)",
               watch_descriptors.len(), watch_count, max_watches - watch_count);
-        if let Some(m) = metrics {
+        if let Some(m) = &ctx.metrics {
             m.inotify_watches.store(watch_count as u64, Ordering::Relaxed);
         }
 
+        Ok(Self {
+            ctx,
+            cache_tx,
+            notifiers,
+            inotify,
+            watch_descriptors,
+            max_watches,
+            pending_dirs: lru(LRU_PENDING_DIRS_SIZE),
+            failed_validations: lru(LRU_FAILED_VALIDATIONS_SIZE),
+            temp_path_last_logged: lru(LRU_TEMP_PATH_LOG_SIZE),
+            overlay_refresh_last: lru(LRU_TEMP_PATH_LOG_SIZE),
+            announced_dirs: lru(LRU_PENDING_DIRS_SIZE),
+            last_cleanup: Instant::now(),
+        })
+    }
+
+    fn run(mut self) -> ! {
         let mut buffer = [0; 4096];
-        let debounce_duration = std::time::Duration::from_secs(sfv_debounce_secs);
-
-        // Poll timeout: 1 second for responsive debounce checking
-        const POLL_TIMEOUT_MS: u16 = 1000;
-
         loop {
-            // Use poll() with timeout to periodically check pending directories
-            // This ensures debounce checks happen even when no inotify events arrive
-            let mut poll_fds = [PollFd::new(inotify.as_fd(), PollFlags::POLLIN)];
-            let poll_result = poll(&mut poll_fds, PollTimeout::from(POLL_TIMEOUT_MS));
+            let events = self.wait_for_events(&mut buffer);
+            let now = Instant::now();
+            self.validate_ready_dirs(now);
+            for event in events.into_iter().flatten() {
+                self.handle_event(event, now);
+            }
+            if self.last_cleanup.elapsed().as_secs() >= CLEANUP_INTERVAL_SECS {
+                self.last_cleanup = Instant::now();
+                self.periodic_cleanup(now);
+            }
+        }
+    }
 
-            // Read events only if data is available (poll returned POLLIN)
-            let events = match poll_result {
-                Ok(n) if n > 0 => {
-                    // Data available, read events
-                    inotify.read_events(&mut buffer).ok()
-                }
-                Ok(_) => {
-                    // Timeout - no events, but we still check pending dirs below
-                    None
-                }
-                Err(e) => {
-                    warn!("Poll error on inotify fd: {}", e);
-                    None
-                }
+    /// Wait up to POLL_TIMEOUT_MS for inotify events. Returning on the timeout
+    /// keeps the debounce checks running while nothing happens on disk.
+    fn wait_for_events<'a>(&mut self, buffer: &'a mut [u8]) -> Option<Events<'a>> {
+        let mut poll_fds = [PollFd::new(self.inotify.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut poll_fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
+            Ok(n) if n > 0 => self.inotify.read_events(buffer).ok(),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Poll error on inotify fd: {}", e);
+                None
+            }
+        }
+    }
+
+    // ── SFV validation of settled release directories ──────────────────────
+
+    /// Validate each pending directory whose files have been quiet for the
+    /// debounce window and that isn't backing off after earlier failures.
+    fn validate_ready_dirs(&mut self, now: Instant) {
+        let debounce = Duration::from_secs(self.ctx.sfv_debounce_secs);
+        let ready: Vec<PathBuf> = self.pending_dirs
+            .iter()
+            .filter(|(_, pending)| !pending.notified && now.duration_since(pending.last_event) >= debounce)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for dir_path in ready {
+            if self.in_backoff(&dir_path, now) {
+                continue;
+            }
+            let Some(sfv_path) = Self::find_sfv_file(&dir_path) else { continue };
+            let started = Instant::now();
+            let valid = validate_sfv_with_completeness(&sfv_path);
+            let took = started.elapsed();
+            debug!("SFV validation for {} took {:.1}ms (result: {})",
+                   dir_path.display(), took.as_secs_f64() * 1000.0, valid);
+            if valid {
+                self.on_validation_passed(&dir_path, took, now);
+            } else {
+                self.on_validation_failed(&dir_path, took, now);
+            }
+        }
+    }
+
+    /// Still backing off after failed validations? Below `max_validation_failures`
+    /// retries back off exponentially (5s → 15s → 45s, capped at the cooldown), so a
+    /// fresh failure isn't retried on every loop iteration; from there on, at most
+    /// one retry per `validation_cooldown_secs`.
+    fn in_backoff(&mut self, dir_path: &Path, now: Instant) -> bool {
+        let cooldown = self.ctx.validation_cooldown_secs;
+        let max_failures = self.ctx.max_validation_failures;
+        let Some(failed) = self.failed_validations.get(dir_path) else { return false };
+        let wait_secs = if failed.failure_count >= max_failures {
+            cooldown
+        } else {
+            5u64.saturating_mul(3u64.saturating_pow(failed.failure_count.saturating_sub(1)))
+                .min(cooldown)
+        };
+        now.duration_since(failed.last_attempt) < Duration::from_secs(wait_secs)
+    }
+
+    /// The SFV checks out: clear any failure state, refresh the overlay so the
+    /// files are visible, and announce the release.
+    fn on_validation_passed(&mut self, dir_path: &Path, took: Duration, now: Instant) {
+        self.failed_validations.pop(dir_path);
+        if let Some(m) = &self.ctx.metrics { m.clear_stuck(dir_path); }
+
+        Self::refresh_overlay_cache(dir_path, &self.ctx.verified_path, self.ctx.overlay_merged_path.as_deref(), &mut self.overlay_refresh_last);
+
+        // A passing SFV implies a valid RAR set — the "media directory" signal.
+        // First sighting announces new media. A later change to an already-known
+        // dir (e.g. a subtitle added) logs one clear "changed" line and refreshes
+        // the servers, but is rate-limited so the burst of events from a single
+        // subtitle add/sync collapses into one line instead of spamming.
+        let (should_notify, is_first_announce) = match self.announced_dirs.get(dir_path).copied() {
+            None => {
+                info!("SFV validation passed for {} (took {:.1}ms)",
+                      dir_path.display(), took.as_secs_f64() * 1000.0);
+                info!("New media dir: {}", dir_path.display());
+                (true, true)
+            }
+            Some(t) if now.duration_since(t) >= Duration::from_secs(RE_NOTIFY_MIN_INTERVAL_SECS) => {
+                info!("Media dir changed, re-notifying media servers: {}", dir_path.display());
+                (true, false)
+            }
+            Some(_) => {
+                // Within the rate-limit window — same operation's churn, skip.
+                debug!("Skipping duplicate re-notification (recent) for {}", dir_path.display());
+                (false, false)
+            }
+        };
+
+        if should_notify {
+            self.announced_dirs.put(dir_path.to_path_buf(), now);
+            self.notifiers.media_servers(dir_path, false);
+            // Sonarr/Radarr get a rescan ONLY on the first announce — that's the
+            // authoritative "the release is now visible, import it in place"
+            // moment. A later change to an already-imported release (a subtitle
+            // or metadata sidecar landing, courtesy of bazarr et al.) has no
+            // *arr relevance: they don't manage external subs, and the rescan
+            // races the overlay-cache refresh — Sonarr's scan can briefly not
+            // see the media file and mark it MissingFromDisk. Media servers
+            // still get poked so external subs show up promptly.
+            if is_first_announce {
+                self.notifiers.arr(dir_path);
+            }
+        }
+
+        // Mark as notified with timestamp for cleanup/re-validation
+        if let Some(pending) = self.pending_dirs.get_mut(dir_path) {
+            pending.notified = true;
+            pending.notified_at = Some(Instant::now());
+        }
+    }
+
+    /// The SFV doesn't check out: count the failure for backoff. Past
+    /// `max_validation_failures` the release is reported as stuck (throttled WARNs,
+    /// then one escalation ERROR) unless it's evidently still downloading.
+    fn on_validation_failed(&mut self, dir_path: &Path, took: Duration, now: Instant) {
+        let max_failures = self.ctx.max_validation_failures;
+        let now_wall = std::time::SystemTime::now();
+        let (failure_count, first_seen) =
+            if let Some(existing) = self.failed_validations.get_mut(dir_path) {
+                existing.failure_count += 1;
+                existing.last_attempt = now;
+                (existing.failure_count, existing.first_seen)
+            } else {
+                self.failed_validations.put(dir_path.to_path_buf(), FailedValidation {
+                    last_attempt: now,
+                    failure_count: 1,
+                    first_seen: now_wall,
+                    last_milestone_logged: 0,
+                    escalated: false,
+                });
+                (1, now_wall)
             };
 
-            // Check pending directories that have passed debounce time
-            let now = Instant::now();
-            let ready_dirs: Vec<PathBuf> = pending_dirs
-                .iter()
-                .filter(|(_, pending)| !pending.notified && now.duration_since(pending.last_event) >= debounce_duration)
-                .map(|(path, _)| path.clone())
-                .collect();
-
-            for dir_path in ready_dirs {
-                // Check if directory is in backoff due to previous failures.
-                //
-                // Two gates apply, in order:
-                //   1. Once `failure_count >= max_validation_failures` we enter the
-                //      long `validation_cooldown_secs` cooldown (existing behaviour).
-                //   2. Below that ceiling, apply an exponential per-attempt backoff
-                //      (5s → 15s → 45s, capped at the cooldown duration) so a
-                //      directory whose first SFV attempt fails doesn't get re-checked
-                //      every loop iteration. Without this, observed behaviour during
-                //      yesterday's incident was 3 failed validations within 14ms.
-                let should_skip = if let Some(failed) = failed_validations.get(&dir_path) {
-                    if failed.failure_count >= max_validation_failures {
-                        now.duration_since(failed.last_attempt) < std::time::Duration::from_secs(validation_cooldown_secs)
-                    } else {
-                        let attempt_backoff = 5u64
-                            .saturating_mul(3u64.saturating_pow(failed.failure_count.saturating_sub(1)))
-                            .min(validation_cooldown_secs);
-                        now.duration_since(failed.last_attempt) < std::time::Duration::from_secs(attempt_backoff)
-                    }
-                } else {
-                    false
-                };
-
-                if should_skip {
-                    continue;  // Skip this directory, still in backoff
-                }
-
-                // Find SFV file in this directory
-                if let Some(sfv_path) = Self::find_sfv_file(&dir_path) {
-                    let validation_start = Instant::now();
-                    let validation_result = validate_sfv_with_completeness(&sfv_path);
-                    let validation_duration = validation_start.elapsed();
-                    debug!("SFV validation for {} took {:.1}ms (result: {})",
-                           dir_path.display(), validation_duration.as_secs_f64() * 1000.0, validation_result);
-
-                    if validation_result {
-                        // SFV valid - clear any previous failure state
-                        failed_validations.pop(&dir_path);
-                        if let Some(m) = metrics { m.clear_stuck(&dir_path); }
-
-                        // Refresh overlay cache so rar2fs sees new files on the next access.
-                        Self::refresh_overlay_cache(&dir_path, verified_path, overlay_merged_path, &mut overlay_refresh_last);
-
-                        // A passing SFV implies a valid RAR set — the "media directory" signal.
-                        // First sighting announces new media. A later change to an already-known
-                        // dir (e.g. a subtitle added) logs one clear "changed" line and refreshes
-                        // the servers, but is rate-limited so the burst of events from a single
-                        // subtitle add/sync collapses into one line instead of spamming.
-                        let last_announce = announced_dirs.get(&dir_path).copied();
-                        let (should_notify, is_first_announce) = match last_announce {
-                            None => {
-                                info!("SFV validation passed for {} (took {:.1}ms)",
-                                      dir_path.display(), validation_duration.as_secs_f64() * 1000.0);
-                                info!("New media dir: {}", dir_path.display());
-                                (true, true)
-                            }
-                            Some(t) if now.duration_since(t) >= std::time::Duration::from_secs(RE_NOTIFY_MIN_INTERVAL_SECS) => {
-                                info!("Media dir changed, re-notifying media servers: {}", dir_path.display());
-                                (true, false)
-                            }
-                            Some(_) => {
-                                // Within the rate-limit window — same operation's churn, skip.
-                                debug!("Skipping duplicate re-notification (recent) for {}", dir_path.display());
-                                (false, false)
-                            }
-                        };
-
-                        if should_notify {
-                            announced_dirs.put(dir_path.clone(), now);
-                            notifiers.media_servers(&dir_path, false);
-                            // Sonarr/Radarr get a rescan ONLY on the first announce — that's the
-                            // authoritative "the release is now visible, import it in place"
-                            // moment. A later change to an already-imported release (a subtitle
-                            // or metadata sidecar landing, courtesy of bazarr et al.) has no
-                            // *arr relevance: they don't manage external subs, and the rescan
-                            // races the overlay-cache refresh — Sonarr's scan can briefly not
-                            // see the media file and mark it MissingFromDisk. Media servers
-                            // still get poked so external subs show up promptly.
-                            if is_first_announce {
-                                notifiers.arr(&dir_path);
-                            }
-                        }
-
-                        // Mark as notified with timestamp for cleanup/re-validation
-                        if let Some(pending) = pending_dirs.get_mut(&dir_path) {
-                            pending.notified = true;
-                            pending.notified_at = Some(Instant::now());
-                        }
-                    } else {
-                        // Validation failed - track failure for backoff
-                        let now_wall = std::time::SystemTime::now();
-                        let (failure_count, first_seen) =
-                            if let Some(existing) = failed_validations.get_mut(&dir_path) {
-                                existing.failure_count += 1;
-                                existing.last_attempt = now;
-                                (existing.failure_count, existing.first_seen)
-                            } else {
-                                failed_validations.put(dir_path.clone(), FailedValidation {
-                                    last_attempt: now,
-                                    failure_count: 1,
-                                    first_seen: now_wall,
-                                    last_milestone_logged: 0,
-                                    escalated: false,
-                                });
-                                (1, now_wall)
-                            };
-
-                        let downloading = failure_count >= max_validation_failures
-                            && has_active_download(&dir_path, std::time::Duration::from_secs(ACTIVE_DOWNLOAD_GRACE_SECS));
-
-                        if downloading {
-                            // Still being downloaded — missing volumes are expected, not a
-                            // stuck release. Backoff/cooldown above still applies; only the
-                            // WARN/ERROR escalation and the status-file flag are skipped.
-                            debug!("SFV validation failing for {} ({} times) but a download is still in progress, not flagging as stuck",
-                                   dir_path.display(), failure_count);
-                            if let Some(m) = metrics { m.clear_stuck(&dir_path); }
-                        } else if failure_count >= max_validation_failures {
-                            let stuck_for = humanize_duration(first_seen.elapsed().unwrap_or_default());
-                            // Read prior throttle state without bumping LRU recency.
-                            let (prev_milestone, already_escalated) = failed_validations
-                                .peek(&dir_path)
-                                .map(|f| (f.last_milestone_logged, f.escalated))
-                                .unwrap_or((0, false));
-
-                            // A directory already in announced_dirs passed validation once —
-                            // now failing means its files were very likely deleted/moved out
-                            // from under it (not a normal still-downloading release), so it
-                            // escalates on a much shorter fuse. peek() to avoid bumping LRU
-                            // recency for what's just a status check.
-                            let is_regression = announced_dirs.peek(&dir_path).is_some();
-                            let effective_escalation_threshold =
-                                if is_regression { regression_escalation_threshold } else { escalation_threshold };
-
-                            if failure_count >= effective_escalation_threshold && !already_escalated {
-                                // One loud, distinct line — easy to spot in the log — then go
-                                // quiet (the status file carries it from here).
-                                if is_regression {
-                                    error!("🛑 REGRESSED MEDIA DIR: {} — was previously valid, now failing SFV validation {} times over {}; files were very likely deleted or moved. Re-grab or remove it.",
-                                           dir_path.display(), failure_count, stuck_for);
-                                } else {
-                                    error!("🛑 PERSISTENT SFV FAILURE: {} — failed {} times over {}; likely an incomplete or abandoned download. Re-grab or remove it.",
-                                           dir_path.display(), failure_count, stuck_for);
-                                }
-                                if let Some(f) = failed_validations.get_mut(&dir_path) {
-                                    f.escalated = true;
-                                    f.last_milestone_logged = failure_count;
-                                }
-                            } else if !already_escalated {
-                                // Throttle WARNs to milestone crossings (3, 10, 50, 100, ...)
-                                // instead of one per cooldown cycle.
-                                let milestone = sfv_failure_milestone(failure_count);
-                                if milestone > prev_milestone {
-                                    warn!("SFV validation failed {} times for {} (stuck {}), entering cooldown ({}s) - check for missing or incomplete files",
-                                          failure_count, dir_path.display(), stuck_for, validation_cooldown_secs);
-                                    if let Some(f) = failed_validations.get_mut(&dir_path) {
-                                        f.last_milestone_logged = milestone;
-                                    }
-                                } else {
-                                    debug!("SFV validation still failing for {} ({} times, stuck {}), in cooldown",
-                                           dir_path.display(), failure_count, stuck_for);
-                                }
-                            } else {
-                                debug!("SFV validation still failing (already escalated) for {} ({} times)",
-                                       dir_path.display(), failure_count);
-                            }
-
-                            // Surface to the status file so operators have one place to look.
-                            if let Some(m) = metrics {
-                                m.record_stuck(&dir_path, failure_count, first_seen);
-                            }
-                        } else {
-                            debug!("SFV validation failed for {} (attempt {}/{}, took {:.1}ms), will retry after next file event",
-                                   dir_path.display(), failure_count, max_validation_failures,
-                                   validation_duration.as_secs_f64() * 1000.0);
-                        }
-                    }
-                }
-            }
-
-            // Process inotify events if available
-            if let Some(events) = events {
-                for event in events {
-                    // Handle Q_OVERFLOW: kernel inotify queue overflowed, events were lost
-                    if event.mask.contains(EventMask::Q_OVERFLOW) {
-                        if let Some(m) = metrics {
-                            m.inotify_overflows.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Suggest increasing max_queued_events if this happens repeatedly
-                        let max_queued = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(16384);
-                        warn!("inotify queue overflow detected - events may have been lost \
-                               (current max_queued_events={}; consider raising it via \
-                               sysctl fs.inotify.max_queued_events={})", max_queued, max_queued * 2);
-                        info!("Clearing pending_dirs and triggering full re-scan of watched verified paths");
-
-                        // Clear pending_dirs since we don't know what events were lost
-                        pending_dirs.clear();
-                        failed_validations.clear();
-
-                        // Re-scan all watched verified paths for SFV files
-                        for (_, watch_path) in watch_descriptors.iter() {
-                            if watch_path.starts_with(verified_path)
-                                && Self::find_sfv_file(watch_path).is_some() {
-                                    pending_dirs.put(watch_path.clone(), PendingDirectory {
-                                        last_event: Instant::now(),
-                                        notified: false,
-                                        notified_at: None,
-                                    });
-                                    debug!("Q_OVERFLOW recovery: queued {} for validation", watch_path.display());
-                                }
-                        }
-
-                        info!("Q_OVERFLOW recovery: queued {} directories for re-validation", pending_dirs.len());
-                        continue; // Q_OVERFLOW has no associated path, skip normal processing
-                    }
-
-                    if let Some(m) = metrics {
-                        m.inotify_events.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    // Get path from watch descriptor
-                    let path = match watch_descriptors.get(&event.wd) {
-                        Some(p) => p.clone(),
-                        None => continue,
-                    };
-
-                    // Build full path with event name
-                    let full_path = if let Some(name) = event.name {
-                        path.join(name)
-                    } else {
-                        path.clone()
-                    };
-
-                    // Skip temporary files (with rate-limited debug logging)
-                    if is_temporary_path(&full_path) {
-                        // Rate-limit debug logging to once per TEMP_PATH_LOG_INTERVAL_SECS per path
-                        let should_log = temp_path_last_logged
-                            .get(&full_path)
-                            .map(|last| last.elapsed().as_secs() >= TEMP_PATH_LOG_INTERVAL_SECS)
-                            .unwrap_or(true);
-
-                        if should_log {
-                            debug!("Skipping temporary path: {}", full_path.display());
-                            temp_path_last_logged.put(full_path.clone(), Instant::now());
-                        }
-                        continue;
-                    }
-
-                    debug!("inotify event: {:?} on {:?}", event.mask, full_path);
-
-                    // Translate source path (verified/unverified) to backend path for cache invalidation
-                    // The dir_cache uses backend paths as keys
-                    let backend_path = Self::translate_to_backend_path(
-                        &full_path,
-                        verified_path,
-                        unverified_path,
-                        rar2fs_backend_path,
-                    );
-
-                    // Always invalidate cache for any file change
-                    Self::invalidate_cache(&cache_tx, &backend_path);
-
-                    // Refresh overlay cache when files change in the verified path
-                    // This forces the overlay to see files written directly to upperdir
-                    if full_path.starts_with(verified_path) {
-                        // Refresh the containing directory (not the file) so a release's
-                        // per-file events coalesce onto a single dedupe key.
-                        if let Some(parent) = full_path.parent() {
-                            Self::refresh_overlay_cache(parent, verified_path, overlay_merged_path, &mut overlay_refresh_last);
-                        }
-                    }
-
-                    // Get the directory containing this file (use event mask instead of syscall)
-                    let event_dir = if event.mask.contains(EventMask::ISDIR) {
-                        full_path.clone()
-                    } else {
-                        full_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| full_path.clone())
-                    };
-
-                    // Determine if this path is in the verified or unverified layer
-                    let is_verified_path = full_path.starts_with(verified_path);
-
-                    // Only notify on structural changes (create, delete, move), not modifications
-                    let is_structural_change = event.mask.contains(EventMask::CREATE)
-                        || event.mask.contains(EventMask::DELETE)
-                        || event.mask.contains(EventMask::MOVED_FROM)
-                        || event.mask.contains(EventMask::MOVED_TO);
-
-                    // Classify structural event as deletion or creation
-                    let is_deletion_event = event.mask.contains(EventMask::DELETE)
-                        || event.mask.contains(EventMask::MOVED_FROM)
-                        || event.mask.contains(EventMask::DELETE_SELF);
-
-                    if is_verified_path {
-                        // VERIFIED PATH: creations require SFV validation; deletions bypass it
-                        if is_structural_change {
-                            if is_deletion_event {
-                                if is_sidecar_file(&full_path) && !event.mask.contains(EventMask::ISDIR) {
-                                    // Transient subtitle/companion churn (e.g. bazarr writing,
-                                    // syncing and renaming a .srt): don't notify servers of the
-                                    // deletion and don't clear the parent dir's validated state.
-                                    debug!("Sidecar file deletion, ignoring: {}", full_path.display());
-                                } else {
-                                    // Files are already gone — bypass SFV, notify directly.
-                                    // ISDIR deletions are handled (and notified) in the dedicated
-                                    // directory-deletion block below to avoid duplicate notifications.
-                                    if !event.mask.contains(EventMask::ISDIR) {
-                                        debug!("Verified path file deletion, notifying directly: {}", full_path.display());
-                                        notifiers.media_servers(&full_path, true);
-                                    }
-                                    // Clean up pending/failure state for the deleted dir
-                                    pending_dirs.pop(&event_dir);
-                                    failed_validations.pop(&event_dir);
-                                }
-                            } else {
-                                // CREATE / MOVED_TO: existing SFV-validation pending logic
-                                // Reset failure state - new file activity should trigger fresh validation attempt
-                                if failed_validations.pop(&event_dir).is_some() {
-                                    debug!("Reset validation backoff for {} due to new file activity", event_dir.display());
-                                }
-
-                                if let Some(pending) = pending_dirs.get_mut(&event_dir) {
-                                    if !pending.notified {
-                                        // Reset debounce timer if not yet notified
-                                        pending.last_event = Instant::now();
-                                        debug!("Debounce reset for verified path: {}", event_dir.display());
-                                    } else if let Some(notified_at) = pending.notified_at {
-                                        // Allow re-validation if notified more than threshold ago
-                                        if now.duration_since(notified_at) >= std::time::Duration::from_secs(revalidation_threshold_secs) {
-                                            pending.notified = false;
-                                            pending.notified_at = None;
-                                            pending.last_event = Instant::now();
-                                            info!("Re-validation triggered for {} (new event {}s after notification)",
-                                                  event_dir.display(), now.duration_since(notified_at).as_secs());
-                                        }
-                                    }
-                                } else {
-                                    // New pending directory
-                                    pending_dirs.put(event_dir.clone(), PendingDirectory {
-                                        last_event: Instant::now(),
-                                        notified: false,
-                                        notified_at: None,
-                                    });
-                                    debug!("Added pending directory (verified): {}", event_dir.display());
-                                }
-                            }
-                        }
-                    } else if is_structural_change {
-                        // UNVERIFIED PATH: Notify immediately (no SFV required)
-                        debug!("Unverified path, notifying immediately (is_deletion={}) for: {}",
-                               is_deletion_event, full_path.display());
-                        notifiers.media_servers(&full_path, is_deletion_event);
-                    }
-
-                    // Handle directory creation or move - watch new directories
-                    if event.mask.contains(EventMask::ISDIR) &&
-                       (event.mask.contains(EventMask::CREATE) || event.mask.contains(EventMask::MOVED_TO)) {
-                        // Skip excluded directories
-                        if is_excluded_dir(exclude_dirs, &full_path) {
-                            debug!("Skipping excluded directory: {}", full_path.display());
-                            continue;
-                        }
-
-                        let watch_count_before = watch_descriptors.len();
-                        info!("New directory detected: {} (adding watches...)", full_path.display());
-                        match Self::add_watch_recursive(&mut inotify, &mut watch_descriptors, &full_path, max_watches, exclude_dirs) {
-                            Ok(()) => {
-                                let watches_added = watch_descriptors.len() - watch_count_before;
-                                info!("  Added {} watches for new directory (total: {})", watches_added, watch_descriptors.len());
-                                if let Some(m) = metrics {
-                                    m.inotify_watches.store(watch_descriptors.len() as u64, Ordering::Relaxed);
-                                }
-
-                                // Race condition fix: check if directory already has content
-                                // Files may have been written before watch was added
-                                if full_path.starts_with(verified_path)
-                                    && Self::find_sfv_file(&full_path).is_some()
-                                        && !pending_dirs.contains(&full_path) {
-                                            pending_dirs.put(full_path.clone(), PendingDirectory {
-                                                last_event: Instant::now(),
-                                                notified: false,
-                                                notified_at: None,
-                                            });
-                                            info!("  Queued for validation (has SFV): {}", full_path.display());
-                                        }
-                            }
-                            Err(e) => {
-                                warn!("Failed to watch new directory {}: {}", full_path.display(), e);
-                            }
-                        }
-                    }
-
-                    // Handle directory deletion - clean up watches and notify media servers
-                    if event.mask.contains(EventMask::DELETE_SELF) {
-                        // The watched directory itself was deleted - remove its watch
-                        watch_descriptors.remove(&event.wd);
-                        pending_dirs.pop(&full_path);
-                        failed_validations.pop(&full_path);
-                        if let Some(m) = metrics { m.clear_stuck(&full_path); }
-                        // Notify media servers that this directory is gone
-                        notifiers.media_servers(&full_path, true);
-                    } else if event.mask.contains(EventMask::DELETE) && event.mask.contains(EventMask::ISDIR) {
-                        // A subdirectory was deleted - only clean up pending_dirs
-                        // DON'T remove from watch_descriptors (event.wd is the parent's watch!)
-                        // The deleted directory's watch will be cleaned up by its own DELETE_SELF event
-                        pending_dirs.pop(&full_path);
-                        failed_validations.pop(&full_path);
-                        if let Some(m) = metrics { m.clear_stuck(&full_path); }
-                        // Notify media servers that this subdirectory is gone
-                        notifiers.media_servers(&full_path, true);
-                    }
-                }
-            }
-
-            // Periodic cleanup - runs every CLEANUP_INTERVAL_SECS (60s)
-            // This reduces CPU overhead from O(n) per second to O(n) per minute
-            // while still allowing timely removal of stale entries
-            if last_cleanup.elapsed().as_secs() >= CLEANUP_INTERVAL_SECS {
-                last_cleanup = Instant::now();
-
-                // Clean up old failure records to prevent memory growth
-                // LruCache doesn't have retain, so collect keys to remove
-                let failure_keys_to_remove: Vec<PathBuf> = failed_validations
-                    .iter()
-                    .filter(|(_, failed)| {
-                        now.duration_since(failed.last_attempt) >= std::time::Duration::from_secs(FAILURE_CLEANUP_THRESHOLD_SECS)
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                for key in failure_keys_to_remove {
-                    failed_validations.pop(&key);
-                    if let Some(m) = metrics { m.clear_stuck(&key); }
-                }
-                // A stuck release deleted without a delete event reaching us
-                // (e.g. its parent removed first) would otherwise stay listed forever.
-                if let Some(m) = metrics {
-                    for gone in m.prune_missing_stuck() {
-                        failed_validations.pop(&gone);
-                    }
-                }
-
-                // Clean up old notified entries from pending_dirs to prevent memory growth
-                let cleanup_threshold = std::time::Duration::from_secs(pending_cleanup_secs);
-                let before_cleanup = pending_dirs.len();
-                let pending_keys_to_remove: Vec<PathBuf> = pending_dirs
-                    .iter()
-                    .filter(|(path, pending)| {
-                        if pending.notified {
-                            if let Some(notified_at) = pending.notified_at {
-                                let should_remove = now.duration_since(notified_at) >= cleanup_threshold;
-                                if should_remove {
-                                    debug!("Cleaning up old notified entry: {}", path.display());
-                                }
-                                should_remove
-                            } else {
-                                false // Keep if notified but no timestamp (shouldn't happen)
-                            }
-                        } else {
-                            false // Keep entries that haven't been notified yet
-                        }
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                for key in pending_keys_to_remove {
-                    pending_dirs.pop(&key);
-                }
-                let cleaned = before_cleanup - pending_dirs.len();
-                if cleaned > 0 {
-                    debug!("Cleaned up {} old pending_dirs entries (remaining: {})", cleaned, pending_dirs.len());
-                }
-
-                // Clean up old temp path log entries (paths not seen for 60+ seconds)
-                let temp_keys_to_remove: Vec<PathBuf> = temp_path_last_logged
-                    .iter()
-                    .filter(|(_, last)| last.elapsed().as_secs() >= 60)
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                for key in temp_keys_to_remove {
-                    temp_path_last_logged.pop(&key);
-                }
-            }
-
-            // No sleep needed - poll() already has 1000ms timeout
+        if failure_count < max_failures {
+            debug!("SFV validation failed for {} (attempt {}/{}, took {:.1}ms), will retry after next file event",
+                   dir_path.display(), failure_count, max_failures, took.as_secs_f64() * 1000.0);
+            return;
         }
+
+        if has_active_download(dir_path, Duration::from_secs(ACTIVE_DOWNLOAD_GRACE_SECS)) {
+            // Still being downloaded — missing volumes are expected, not a
+            // stuck release. Backoff/cooldown above still applies; only the
+            // WARN/ERROR escalation and the status-file flag are skipped.
+            debug!("SFV validation failing for {} ({} times) but a download is still in progress, not flagging as stuck",
+                   dir_path.display(), failure_count);
+            if let Some(m) = &self.ctx.metrics { m.clear_stuck(dir_path); }
+            return;
+        }
+
+        self.report_stuck(dir_path, failure_count, first_seen);
+    }
+
+    /// Log a persistently failing release — WARN at milestone failure counts, one
+    /// escalation ERROR past the threshold — and list it in the status file.
+    fn report_stuck(&mut self, dir_path: &Path, failure_count: u32, first_seen: std::time::SystemTime) {
+        let stuck_for = humanize_duration(first_seen.elapsed().unwrap_or_default());
+        // Read prior throttle state without bumping LRU recency.
+        let (prev_milestone, already_escalated) = self.failed_validations
+            .peek(dir_path)
+            .map(|f| (f.last_milestone_logged, f.escalated))
+            .unwrap_or((0, false));
+
+        // A directory already in announced_dirs passed validation once — now
+        // failing means its files were very likely deleted/moved out from under
+        // it (not a normal still-downloading release), so it escalates on a much
+        // shorter fuse. peek() to avoid bumping LRU recency for a status check.
+        let is_regression = self.announced_dirs.peek(dir_path).is_some();
+        let escalate_at = if is_regression {
+            self.ctx.regression_escalation_threshold
+        } else {
+            self.ctx.escalation_threshold
+        };
+
+        if already_escalated {
+            debug!("SFV validation still failing (already escalated) for {} ({} times)",
+                   dir_path.display(), failure_count);
+        } else if failure_count >= escalate_at {
+            // One loud, distinct line — easy to spot in the log — then go quiet
+            // (the status file carries it from here).
+            if is_regression {
+                error!("🛑 REGRESSED MEDIA DIR: {} — was previously valid, now failing SFV validation {} times over {}; files were very likely deleted or moved. Re-grab or remove it.",
+                       dir_path.display(), failure_count, stuck_for);
+            } else {
+                error!("🛑 PERSISTENT SFV FAILURE: {} — failed {} times over {}; likely an incomplete or abandoned download. Re-grab or remove it.",
+                       dir_path.display(), failure_count, stuck_for);
+            }
+            if let Some(f) = self.failed_validations.get_mut(dir_path) {
+                f.escalated = true;
+                f.last_milestone_logged = failure_count;
+            }
+        } else {
+            // Throttle WARNs to milestone crossings (3, 10, 50, 100, ...)
+            // instead of one per cooldown cycle.
+            let milestone = sfv_failure_milestone(failure_count);
+            if milestone > prev_milestone {
+                warn!("SFV validation failed {} times for {} (stuck {}), entering cooldown ({}s) - check for missing or incomplete files",
+                      failure_count, dir_path.display(), stuck_for, self.ctx.validation_cooldown_secs);
+                if let Some(f) = self.failed_validations.get_mut(dir_path) {
+                    f.last_milestone_logged = milestone;
+                }
+            } else {
+                debug!("SFV validation still failing for {} ({} times, stuck {}), in cooldown",
+                       dir_path.display(), failure_count, stuck_for);
+            }
+        }
+
+        // Surface to the status file so operators have one place to look.
+        if let Some(m) = &self.ctx.metrics {
+            m.record_stuck(dir_path, failure_count, first_seen);
+        }
+    }
+
+    // ── inotify events ──────────────────────────────────────────────────────
+
+    fn handle_event(&mut self, event: Event<&OsStr>, now: Instant) {
+        if event.mask.contains(EventMask::Q_OVERFLOW) {
+            self.recover_from_overflow();
+            return;
+        }
+        if let Some(m) = &self.ctx.metrics {
+            m.inotify_events.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let Some(watched_dir) = self.watch_descriptors.get(&event.wd) else { return };
+        let full_path = match event.name {
+            Some(name) => watched_dir.join(name),
+            None => watched_dir.clone(),
+        };
+        if is_temporary_path(&full_path) {
+            self.log_skipped_temporary(&full_path);
+            return;
+        }
+        debug!("inotify event: {:?} on {:?}", event.mask, full_path);
+
+        // The FUSE directory cache is keyed by backend path; invalidate on any change.
+        let backend_path = Self::translate_to_backend_path(
+            &full_path,
+            &self.ctx.verified_path,
+            &self.ctx.unverified_path,
+            &self.ctx.rar2fs_backend_path,
+        );
+        Self::invalidate_cache(&self.cache_tx, &backend_path);
+
+        let is_verified_path = full_path.starts_with(&self.ctx.verified_path);
+        if is_verified_path {
+            // Files written straight into the verified upperdir only show in the overlay
+            // once it re-reads the directory. Refresh the containing directory (not the
+            // file) so a release's per-file events coalesce onto one dedupe key.
+            if let Some(parent) = full_path.parent() {
+                Self::refresh_overlay_cache(parent, &self.ctx.verified_path, self.ctx.overlay_merged_path.as_deref(), &mut self.overlay_refresh_last);
+            }
+        }
+
+        let is_dir = event.mask.contains(EventMask::ISDIR);
+        let event_dir = if is_dir {
+            full_path.clone()
+        } else {
+            full_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| full_path.clone())
+        };
+        // Only structural changes (create, delete, move) notify, not modifications.
+        let is_structural_change = event.mask.contains(EventMask::CREATE)
+            || event.mask.contains(EventMask::DELETE)
+            || event.mask.contains(EventMask::MOVED_FROM)
+            || event.mask.contains(EventMask::MOVED_TO);
+        let is_deletion = event.mask.contains(EventMask::DELETE)
+            || event.mask.contains(EventMask::MOVED_FROM)
+            || event.mask.contains(EventMask::DELETE_SELF);
+
+        if is_structural_change {
+            if !is_verified_path {
+                // Unverified layer: no SFV required, notify immediately.
+                debug!("Unverified path, notifying immediately (is_deletion={}) for: {}",
+                       is_deletion, full_path.display());
+                self.notifiers.media_servers(&full_path, is_deletion);
+            } else if is_deletion {
+                self.on_verified_deletion(&full_path, &event_dir, is_dir);
+            } else {
+                // Verified layer: creations wait for SFV validation.
+                self.mark_pending(&event_dir, now);
+            }
+        }
+
+        if is_dir && (event.mask.contains(EventMask::CREATE) || event.mask.contains(EventMask::MOVED_TO)) {
+            self.watch_new_dir(&full_path);
+        }
+
+        if event.mask.contains(EventMask::DELETE_SELF) {
+            // The watched directory itself was deleted - remove its watch
+            self.watch_descriptors.remove(&event.wd);
+            self.forget_dir(&full_path);
+        } else if event.mask.contains(EventMask::DELETE) && is_dir {
+            // A subdirectory was deleted. Its watch is NOT removed here (event.wd is
+            // the parent's watch); the subdirectory's own DELETE_SELF does that.
+            self.forget_dir(&full_path);
+        }
+    }
+
+    /// The kernel's inotify queue overflowed and events were lost. Start over:
+    /// drop pending and failure state and queue every watched verified directory
+    /// that has an SFV for validation.
+    fn recover_from_overflow(&mut self) {
+        if let Some(m) = &self.ctx.metrics {
+            m.inotify_overflows.fetch_add(1, Ordering::Relaxed);
+        }
+        let max_queued = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(16384);
+        warn!("inotify queue overflow detected - events may have been lost \
+               (current max_queued_events={}; consider raising it via \
+               sysctl fs.inotify.max_queued_events={})", max_queued, max_queued * 2);
+        info!("Clearing pending_dirs and triggering full re-scan of watched verified paths");
+
+        self.pending_dirs.clear();
+        self.failed_validations.clear();
+        for watch_path in self.watch_descriptors.values() {
+            if watch_path.starts_with(&self.ctx.verified_path) && Self::find_sfv_file(watch_path).is_some() {
+                self.pending_dirs.put(watch_path.clone(), PendingDirectory::new());
+                debug!("Q_OVERFLOW recovery: queued {} for validation", watch_path.display());
+            }
+        }
+        info!("Q_OVERFLOW recovery: queued {} directories for re-validation", self.pending_dirs.len());
+    }
+
+    /// Debug-log a skipped temporary path, at most once per TEMP_PATH_LOG_INTERVAL_SECS per path.
+    fn log_skipped_temporary(&mut self, path: &Path) {
+        let should_log = self.temp_path_last_logged
+            .get(path)
+            .map(|last| last.elapsed().as_secs() >= TEMP_PATH_LOG_INTERVAL_SECS)
+            .unwrap_or(true);
+        if should_log {
+            debug!("Skipping temporary path: {}", path.display());
+            self.temp_path_last_logged.put(path.to_path_buf(), Instant::now());
+        }
+    }
+
+    /// A file or directory in the verified layer was deleted or moved away.
+    fn on_verified_deletion(&mut self, full_path: &Path, event_dir: &Path, is_dir: bool) {
+        if is_sidecar_file(full_path) && !is_dir {
+            // Transient subtitle/companion churn (e.g. bazarr writing, syncing and
+            // renaming a .srt): don't notify servers of the deletion and don't clear
+            // the parent dir's validated state.
+            debug!("Sidecar file deletion, ignoring: {}", full_path.display());
+            return;
+        }
+        // The files are already gone, so skip SFV and notify directly. Directory
+        // deletions are notified by forget_dir, to avoid notifying twice.
+        if !is_dir {
+            debug!("Verified path file deletion, notifying directly: {}", full_path.display());
+            self.notifiers.media_servers(full_path, true);
+        }
+        self.pending_dirs.pop(event_dir);
+        self.failed_validations.pop(event_dir);
+    }
+
+    /// New file activity in a verified directory: (re)start its debounce window,
+    /// and clear any failure backoff so it gets a fresh validation attempt.
+    fn mark_pending(&mut self, event_dir: &Path, now: Instant) {
+        if self.failed_validations.pop(event_dir).is_some() {
+            debug!("Reset validation backoff for {} due to new file activity", event_dir.display());
+        }
+
+        let Some(pending) = self.pending_dirs.get_mut(event_dir) else {
+            self.pending_dirs.put(event_dir.to_path_buf(), PendingDirectory::new());
+            debug!("Added pending directory (verified): {}", event_dir.display());
+            return;
+        };
+        if !pending.notified {
+            pending.last_event = Instant::now();
+            debug!("Debounce reset for verified path: {}", event_dir.display());
+        } else if let Some(notified_at) = pending.notified_at {
+            // Already announced: allow re-validation once the threshold has passed,
+            // which retries a notification that may not have landed.
+            if now.duration_since(notified_at) >= Duration::from_secs(self.ctx.revalidation_threshold_secs) {
+                pending.notified = false;
+                pending.notified_at = None;
+                pending.last_event = Instant::now();
+                info!("Re-validation triggered for {} (new event {}s after notification)",
+                      event_dir.display(), now.duration_since(notified_at).as_secs());
+            }
+        }
+    }
+
+    /// Watch a newly created or moved-in directory tree, and queue it for
+    /// validation if its files (and SFV) landed before the watch was added.
+    fn watch_new_dir(&mut self, dir_path: &Path) {
+        if is_excluded_dir(&self.ctx.exclude_dirs, dir_path) {
+            debug!("Skipping excluded directory: {}", dir_path.display());
+            return;
+        }
+
+        let watch_count_before = self.watch_descriptors.len();
+        info!("New directory detected: {} (adding watches...)", dir_path.display());
+        if let Err(e) = Self::add_watch_recursive(&mut self.inotify, &mut self.watch_descriptors, dir_path, self.max_watches, &self.ctx.exclude_dirs) {
+            warn!("Failed to watch new directory {}: {}", dir_path.display(), e);
+            return;
+        }
+        let watches_added = self.watch_descriptors.len() - watch_count_before;
+        info!("  Added {} watches for new directory (total: {})", watches_added, self.watch_descriptors.len());
+        if let Some(m) = &self.ctx.metrics {
+            m.inotify_watches.store(self.watch_descriptors.len() as u64, Ordering::Relaxed);
+        }
+
+        if dir_path.starts_with(&self.ctx.verified_path)
+            && Self::find_sfv_file(dir_path).is_some()
+            && !self.pending_dirs.contains(dir_path)
+        {
+            self.pending_dirs.put(dir_path.to_path_buf(), PendingDirectory::new());
+            info!("  Queued for validation (has SFV): {}", dir_path.display());
+        }
+    }
+
+    /// A watched directory is gone: drop its pending, failure and stuck state and
+    /// tell the media servers.
+    fn forget_dir(&mut self, dir_path: &Path) {
+        self.pending_dirs.pop(dir_path);
+        self.failed_validations.pop(dir_path);
+        if let Some(m) = &self.ctx.metrics { m.clear_stuck(dir_path); }
+        self.notifiers.media_servers(dir_path, true);
+    }
+
+    // ── periodic cleanup ────────────────────────────────────────────────────
+
+    /// Prune entries the caches no longer need. Runs every CLEANUP_INTERVAL_SECS
+    /// rather than every iteration, since each pass walks every cache.
+    fn periodic_cleanup(&mut self, now: Instant) {
+        // Failure records not retried in an hour. LruCache has no retain, so collect keys first.
+        let stale_failures: Vec<PathBuf> = self.failed_validations
+            .iter()
+            .filter(|(_, failed)| now.duration_since(failed.last_attempt) >= Duration::from_secs(FAILURE_CLEANUP_THRESHOLD_SECS))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for key in stale_failures {
+            self.failed_validations.pop(&key);
+            if let Some(m) = &self.ctx.metrics { m.clear_stuck(&key); }
+        }
+        // A stuck release deleted without a delete event reaching us
+        // (e.g. its parent removed first) would otherwise stay listed forever.
+        if let Some(m) = &self.ctx.metrics {
+            for gone in m.prune_missing_stuck() {
+                self.failed_validations.pop(&gone);
+            }
+        }
+
+        // Announced directories, once past the cleanup window.
+        let cleanup_threshold = Duration::from_secs(self.ctx.pending_cleanup_secs);
+        let before_cleanup = self.pending_dirs.len();
+        let done: Vec<PathBuf> = self.pending_dirs
+            .iter()
+            .filter(|(_, pending)| {
+                pending.notified
+                    && pending.notified_at.is_some_and(|at| now.duration_since(at) >= cleanup_threshold)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for key in done {
+            debug!("Cleaning up old notified entry: {}", key.display());
+            self.pending_dirs.pop(&key);
+        }
+        let cleaned = before_cleanup - self.pending_dirs.len();
+        if cleaned > 0 {
+            debug!("Cleaned up {} old pending_dirs entries (remaining: {})", cleaned, self.pending_dirs.len());
+        }
+
+        // Temporary-path log entries not seen for a minute.
+        let quiet: Vec<PathBuf> = self.temp_path_last_logged
+            .iter()
+            .filter(|(_, last)| last.elapsed().as_secs() >= 60)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for key in quiet {
+            self.temp_path_last_logged.pop(&key);
+        }
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// The inotify watch budget: 80% of /proc/sys/fs/inotify/max_user_watches,
+    /// leaving headroom for other applications. Returns (max_watches, system_limit).
+    fn get_max_watches() -> (usize, usize) {
+        let system_limit = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(8192); // Conservative fallback if unable to read system limit
+        let max_watches = (system_limit * 80) / 100;
+
+        info!("System inotify limit: {} watches", system_limit);
+        info!("RARGate will use up to {} watches (80% of system limit)", max_watches);
+
+        (max_watches, system_limit)
     }
 
     /// Translate a source layer path (verified/unverified) to the rar2fs backend path
@@ -1143,7 +1108,7 @@ impl InotifyWatcher {
     /// Recursively add inotify watches for a directory tree with depth and count limits
     fn add_watch_recursive_limited(
         inotify: &mut Inotify,
-        watch_map: &mut HashMap<inotify::WatchDescriptor, PathBuf>,
+        watch_map: &mut HashMap<WatchDescriptor, PathBuf>,
         path: &Path,
         current_depth: usize,
         watch_count: &mut usize,
@@ -1210,14 +1175,13 @@ impl InotifyWatcher {
     /// Wrapper for add_watch_recursive (for newly created directories)
     fn add_watch_recursive(
         inotify: &mut Inotify,
-        watch_map: &mut HashMap<inotify::WatchDescriptor, PathBuf>,
+        watch_map: &mut HashMap<WatchDescriptor, PathBuf>,
         path: &Path,
         max_watches: usize,
         exclude_dirs: &[String],
     ) -> Result<()> {
         let mut watch_count = watch_map.len();
-        const MAX_DEPTH: usize = 10;
-        let limits = WatchLimits { max_depth: MAX_DEPTH, max_watches, exclude_dirs };
+        let limits = WatchLimits { max_depth: MAX_WATCH_DEPTH, max_watches, exclude_dirs };
         Self::add_watch_recursive_limited(inotify, watch_map, path, 0, &mut watch_count, &limits)
     }
 
